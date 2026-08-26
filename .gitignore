@@ -1,0 +1,6 @@
+# Build artifacts — regenerate automatically via `pip install -e .` / `python -m build`
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.pyc

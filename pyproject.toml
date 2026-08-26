@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigularty"
+dynamic = ["version"]
+description = "Production-grade PyTorch model compression: pruning, LRF, clustering, quantization, GPTQ."
+readme = {file = "PublicReadme.md", content-type = "text/markdown"}
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+authors = [
+    {name = "sigularty"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: Other/Proprietary License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "torchmetrics>=0.11",
+    "tqdm",
+    "numpy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+pruning = ["torch-pruning>=1.3"]
+full = ["torch-pruning>=1.3", "onnx", "onnxruntime"]
+
+[tool.setuptools.dynamic]
+version = {attr = "sigularty.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["sigularty*"]
