@@ -1,0 +1,97 @@
+# .github/workflows/build-wheels.yml
+#
+# Builds the sigularty package — pure Python, so a single universal wheel
+# (+ sdist) covers every platform and every supported Python version. No
+# per-OS/per-interpreter matrix needed (that was only ever required for
+# compiled Cython extensions).
+#
+# SETUP REQUIRED (one-time, in your GitHub repo Settings → Secrets):
+#   PYPI_API_TOKEN — get from https://pypi.org/manage/account/token/
+#
+# TRIGGERING:
+#   - Automatic: create a GitHub Release (tag format: v0.1.0) → builds AND publishes
+#   - Manual:    Actions → build-wheels → Run workflow → builds only, never publishes
+
+name: Build & Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:     # manual trigger — build/import-check only, no publish
+
+jobs:
+  build:
+    name: Build wheel + sdist
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: pip install build
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Quick import check
+        run: |
+          pip install dist/*.whl
+          python -c "
+          import sigularty
+
+          # Every name __init__.py claims to export via __all__ must actually
+          # be importable — this is exactly the check that would have caught
+          # 'load_from_registry missing from __init__.py's import list' before
+          # it shipped (v1.1.1 exported load_model_and_data and 9 others, but
+          # NOT load_from_registry, despite PublicReadme.md documenting it as
+          # the primary top-level entry point). A two-name spot-check
+          # (compress, analyze) cannot catch a missing THIRD name — this
+          # walks the full declared surface instead of an arbitrary sample.
+          missing = [name for name in sigularty.__all__ if not hasattr(sigularty, name)]
+          if missing:
+              raise ImportError(f'__all__ declares these names but they are not actually importable: {missing}')
+
+          print(f'Import OK — verified all {len(sigularty.__all__)} public exports: {sorted(sigularty.__all__)}')
+          "
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write    # needed to attach dist files to the GitHub Release
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sigularty/
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
