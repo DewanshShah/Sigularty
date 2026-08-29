@@ -154,23 +154,38 @@ Use these when the model hasn't been trained on your target dataset yet
 | `pruning_search_trials` | `16` | Evaluation budget for the pruning search. |
 | `pruning_search_ft_epochs` | `1` | Fine-tune epochs per trial during the pruning search (kept low for speed: the real run uses `pruning_fine_tune_epochs`). |
 | `pruning_search_ft_lr` | `1e-4` | Fine-tune learning rate per trial during the pruning search. |
-| `accuracy_drop_threshold` | `5.0` | Max acceptable accuracy drop in percentage points: used by both searches' final selection AND the pipeline's per-technique revert gate (Phase A only — see "Accuracy-drop gating" below). |
-| `early_abort_threshold` | `None` | **New.** Direct pp value (not a multiplier on `accuracy_drop_threshold`). After epoch 1 of Pruning's or LRF's own recovery fine-tune — in both the real pipeline and their searches — abort the remaining epochs if the drop vs. the original baseline already exceeds this. `None` (default) = disabled; every fine-tune always runs to completion. |
-| `epsilon_cache_path` | `None` | **New.** Override the auto-derived per-model cache file for the epsilon search. `None` = `.sigularty_cache/epsilon_<model>.json`. |
-| `pruning_cache_path` | `None` | **New.** Override the auto-derived per-model cache file for the pruning search. `None` = `.sigularty_cache/pruning_<model>.json`. |
+| `accuracy_drop_threshold` | `5.0` | Max acceptable accuracy drop in percentage points: used by both searches' final selection AND the pipeline's per-technique revert gate (now Phase A AND Phase B — see "Accuracy-drop gating" below). |
+| `early_abort_threshold` | `None` | Direct pp value (not a multiplier on `accuracy_drop_threshold`). After epoch 1 of Pruning's or LRF's own recovery fine-tune — in both the real pipeline and their searches — abort the remaining epochs if the drop vs. the original baseline already exceeds this. `None` (default) = disabled; every fine-tune always runs to completion. |
+| `epsilon_cache_path` | `None` | Override the auto-derived per-model cache file for the epsilon search. `None` = `.sigularty_cache/epsilon_<model>.json`. |
+| `pruning_cache_path` | `None` | Override the auto-derived per-model cache file for the pruning search. `None` = `.sigularty_cache/pruning_<model>.json`. |
 
-**Accuracy-drop gating is always active in Phase A (new behaviour).**
-Structured Pruning, Low-Rank Factorization, Weight Clustering, and the
-in-pipeline KD step are each measured before/after and reverted to their
+**Accuracy-drop gating is always active across BOTH phases (v1.2.2).**
+Structured Pruning, Low-Rank Factorization, and Weight Clustering (Phase A)
+AND GPTQ, standard Quantization, and the final KD recovery fine-tune
+(Phase B) are each measured before/after and reverted to their
 pre-technique state if that ONE technique's own marginal drop exceeds
 `accuracy_drop_threshold`. Each technique gets an independent budget — an
 earlier costly technique does not eat into a later technique's allowance.
 A reverted technique will not appear in `result.techniques_applied` —
 check the console output for a `❌ [TechniqueName] SKIPPED — accuracy
 dropped ...` line if a technique you enabled seems to be missing.
-**Phase B (standard Quantization, GPTQ) is not gated** — those two run
-after Phase A completes and always apply once enabled; see README.md for
-why they're handled differently.
+
+**GPTQ uses a QAT-aware (straight-through estimator) path whenever
+`use_kd_finetune=True`**, so the final KD fine-tune below can actually
+update GPTQ-quantized weights instead of finding them frozen — collapsed
+back to compact storage automatically once KD finishes. If the final KD
+step's cumulative recovery still falls short of `accuracy_drop_threshold`
+after its own gate passes, one bounded, LR-adjusted retry runs
+automatically before the result is accepted as-is. (Earlier versions of
+`compress()` left Phase B completely ungated and ran KD *before* Phase B —
+meaning quantization/GPTQ damage had no gate to catch it and no recovery
+pass to fix it, even though this file's own KD docs already described KD
+as running "after quantization/GPTQ." Both are fixed now: KD always runs
+*after* Phase B, matching that description, which was previously
+aspirational for `compress()` specifically. One deliberate divergence from
+`run_compression_pipeline()`'s CLI path remains: fp16 is *not* skipped
+here when GPTQ is absent or reverted — fp16-only stays a fully independent,
+always-available configuration for `compress()`.)
 
 **Search result caching (fixed — was previously a silent correctness
 bug).** Each search caches trial results to disk purely by hyperparameter
@@ -205,7 +220,7 @@ version in your working directory, they're now orphaned — safe to delete.
 |---|---|---|
 | `pruning_ratio` | `0.3` | Target fraction of channels removed globally. |
 | `pruning_max_ratio` | `0.95` | Hard cap on how much any single layer/dependency-group can be pruned. |
-| `pruning_residual_max_ratio` | `None` | **New.** Ceiling specifically for auto-detected residual/skip-connection-coupled groups — the layers whose channel count IS the residual stream for an entire network stage, so collapsing them damages every downstream block in that stage, not just one layer's worth of capacity. `None` (default) falls back to `pruning_max_ratio` above. See README.md's "Architecture-Agnostic Residual Group Detection" section for the detection mechanism. |
+| `pruning_residual_max_ratio` | `None` | Ceiling specifically for auto-detected residual/skip-connection-coupled groups — the layers whose channel count IS the residual stream for an entire network stage, so collapsing them damages every downstream block in that stage, not just one layer's worth of capacity. `None` (default) falls back to `pruning_max_ratio` above. See README.md's "Architecture-Agnostic Residual Group Detection" section for the detection mechanism. |
 | `pruning_model_type` | `'classifier'` | Same role as `model_type`, specific to pruning's clamp. |
 | `pruning_fine_tune_epochs` | `3` | KD recovery epochs after pruning. |
 | `pruning_fine_tune_lr` | `1e-4` | Learning rate for that recovery fine-tune. |
@@ -249,8 +264,13 @@ actually applies may now be meaningfully different (and safer).
 
 ### Knowledge distillation fine-tuning hyperparameters
 
-The final recovery step, run after quantization/GPTQ so it can recover
-accuracy lost from every prior step at once.
+The final recovery step. As of v1.2.2 this is genuinely true rather than
+aspirational: KD now always runs after quantization/GPTQ (Phase B), never
+inside Phase A, so it recovers accuracy lost from every prior step at
+once — including quantization/GPTQ's own damage, now that Phase B is
+gated too (see "Accuracy-drop gating" above). If GPTQ is enabled, it uses
+a QAT-aware path specifically so this step can update GPTQ-quantized
+weights rather than finding them frozen.
 
 | Arg | Default | What it does |
 |---|---|---|
@@ -258,6 +278,7 @@ accuracy lost from every prior step at once.
 | `kd_lr` | `1e-5` | Learning rate. |
 | `kd_temperature` | `4.0` | Softmax temperature for the teacher's soft labels. |
 | `kd_alpha` | `0.7` | Weight on hard-label loss; `1 - kd_alpha` goes to the distillation loss. |
+| `kd_max_batches` | `50` | Max batches per KD epoch, matching `main.py`'s CLI default. Use `0` for the full dataloader each epoch. Previously not exposed — the old in-pipeline KD path silently inherited a different function's default of the same value. |
 
 ### Quantization hyperparameters
 
