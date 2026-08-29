@@ -59,8 +59,6 @@ Low-Rank Factorization  (standard global epsilon or adaptive per-layer SVD energ
     ↓
 Weight Clustering  (GPU k-means, stays on-device)              [gated]
     ↓
-── Phase A / Phase B boundary ──
-    ↓
 GPTQ INT4/INT8  (Hessian-corrected, Linear layers only)         [gated]
     ↓
 Quantization (fp16 / dynamic INT8)                              [gated]
