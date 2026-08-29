@@ -7,7 +7,6 @@ This file is a thin orchestration layer — it does not implement compression
 algorithms itself. The actual logic lives in the sibling modules:
 compression.py, optimization.py, helper_functions.py, model_registry.py,
 visualization.py.
-
 """
 
 from __future__ import annotations
@@ -349,6 +348,7 @@ def compress(
     kd_lr:                   float           = 1e-5,
     kd_temperature:          float           = 4.0,
     kd_alpha:                float           = 0.7,
+    kd_max_batches:          int             = 50,
     # ── Quantization hyperparameters ─────────────────────────────────────────
     quant_mode:              str             = 'fp16',
     quant_cal_batches:       int             = 100,
@@ -369,8 +369,8 @@ def compress(
     Compress a PyTorch model.
 
     Runs BN Fusion → (optional Pruning) → (optional LRF) → (optional Clustering)
-    → (optional KD Fine-tuning) → (optional Quantization) → (optional GPTQ)
-    in a fixed order.  The original model is never modified.
+    → (optional GPTQ) → (optional Quantization) → (optional KD Fine-tuning)
+    in a fixed order. The original model is never modified.
 
     Parameters
     ----------
@@ -385,8 +385,41 @@ def compress(
 
     Notes
     -----
-    Latency is always measured in float32 on the target device so GPU vs GPU comparisons are fair.  Accuracy and size use the final
+    Latency is always measured in float32 on the target device (Phase A model)
+    so GPU vs GPU comparisons are fair.  Accuracy and size use the final
     compressed model which may be INT8/fp16.
+
+    Accuracy-drop gating is always active across BOTH phases:
+    Structured Pruning, Low-Rank Factorization, and Weight Clustering
+    and GPTQ, standard Quantization, and the final KD recovery
+    fine-tune are each individually measured before/after and
+    reverted to their pre-technique state if that ONE technique's own
+    marginal accuracy drop exceeds accuracy_drop_threshold. A reverted
+    technique will not appear in the returned
+    CompressionResult.techniques_applied. This matches
+    run_compression_pipeline()'s gating exactly, including:
+      - QAT-aware GPTQ (apply_gptq_quantization(..., qat=use_kd_finetune))
+        so the final KD step can actually recover accuracy from
+        GPTQ-quantized weights via a straight-through estimator, rather
+        than finding them frozen;
+      - collapse_qat_layers() afterward, shrinking those layers back to
+        compact frozen INT4 storage once KD finishes;
+      - one bounded, LR-adjusted retry if KD's cumulative recovery (vs. the
+        absolute original baseline) still falls short of
+        accuracy_drop_threshold after KD's own gate already passed.
+    See apply_compression_pipeline() in compression.py,
+    run_compression_pipeline() in helper_functions.py (the reference this
+    mirrors), and "Global Accuracy-Drop Threshold & Per-Technique
+    Gating" in README.md for the full mechanism.
+
+    The KD fine-tune (use_kd_finetune) now ALWAYS runs after GPTQ/
+    Quantization — never inside — so it recovers accuracy lost to
+    every prior step at once, matching what this file's own KD parameter
+    docs already described. Earlier versions
+    ran KD inside, before quantization/GPTQ existed, so it could
+    never recover from their damage — this was the direct cause of an
+    ungated ~16pp accuracy drop surviving all the way to the returned
+    result in one real stress test.
 
     Search caches (epsilon_cache_path / pruning_cache_path): each search's
     trial-by-trial results are cached to disk purely by hyperparameter value
@@ -402,12 +435,17 @@ def compress(
     from sigularty.compression import (
         apply_compression_pipeline,
         apply_quantization,
+        apply_gptq_quantization,
+        collapse_qat_layers,
+        fine_tune_with_distillation,
     )
     from sigularty.helper_functions import (
         get_model_size_mb,
         measure_accuracy,
         measure_latency,
         count_parameters,
+        gate_technique_accuracy,
+        report_technique_impact,
     )
     from sigularty.optimization import (
         compression_quality_index,
@@ -535,9 +573,12 @@ def compress(
                   f"steps={pruning_iterative_steps}")
 
     # ── Phase A: Structural compression (float32) ─────────────────────────────
-    # BN Fusion, Pruning, LRF, Clustering, KD Fine-tune.
+    # BN Fusion, Pruning, LRF, Clustering.
     # Quantization is deferred — quantized tensors (qint8) have no CUDA kernel,
     # making GPU latency comparisons unfair.
+    # use_kd_finetune=False is now ALWAYS passed here— the KD
+    # fine-tune runs exactly once, so it can recover
+    # accuracy lost to quantization/GPTQ too.
     print("\n[compress] Phase A: Structural compression...")
     compressed_pre_quant = apply_compression_pipeline(
         model=model,
@@ -547,9 +588,9 @@ def compress(
         use_pruning=use_pruning,
         use_low_rank=use_lrf,
         use_clustering=use_clustering,
-        use_kd_finetune=use_kd_finetune,
-        use_quantization=use_quantization,
-        use_gptq= use_gptq,
+        use_kd_finetune=False,          
+        use_quantization=False,         
+        use_gptq=False,                 
         pruning_ratio=pruning_ratio,
         pruning_model_type=pruning_model_type,
         pruning_num_classes=num_classes,
@@ -601,52 +642,338 @@ def compress(
         input_dtype=input_dtype,
     )['mean_ms']
 
-    # ── Phase B: Quantization ─────────────────────────────────────────────────
-    compressed_model = copy.deepcopy(compressed_pre_quant)
+    # current_accuracy is threaded through the entire rest of this function —
+    # every gate below reads/updates it, exactly mirroring
+    # run_compression_pipeline()'s own current_accuracy variable. Phase A's
+    # own gating (test_loader was passed above, so gating was active) already
+    # measured this as ._gating_accuracy; reusing it avoids a redundant
+    # measure_accuracy() call for an identical number.
+    current_accuracy = getattr(compressed_pre_quant, '_gating_accuracy', baseline_acc)
 
-    if use_quantization:
-        print(f"\n[compress] Phase B: Quantization ({quant_mode})...")
-        quant_input = copy.deepcopy(compressed_pre_quant)
+    # ── Phase B: GPTQ → Quantization → final KD recovery (all gated) ─────────
+    # Mirrors run_compression_pipeline()'s Phase B (helper_functions.py)
+    # closely — see this file's CHANGE LOG (v1.2.2) above for exactly what
+    # changed and why. GPTQ and standard Quantization are each individually
+    # measured before/after and reverted on their own marginal accuracy drop;
+    # the final KD recovery fine-tune runs LAST, after both, so it can
+    # recover accuracy lost to quantization/GPTQ too — not just to Phase A's
+    # structural changes.
+    compressed_model = compressed_pre_quant
+
+    # Tracks whether the FINAL compressed_model ended up as a dynamic-INT8
+    # (CPU-resident) model. A real tracked flag rather than re-deriving from
+    # quant_mode, because gating can revert dynamic quant back to a
+    # GPU-resident fp32 model — every later device-dependent decision reads
+    # this flag instead of re-checking quant_mode.
+    _final_quant_is_dynamic = False
+    _use_gptq   = use_gptq     # local, mutable copy — becomes False if reverted
+    _quant_kept = False
+    _kd_kept    = False
+
+    # ── GPTQ (gated) ───────────────────────────────────────────────────────────
+    if _use_gptq:
+        print(f"\n[compress] Phase B — GPTQ INT{gptq_bits}...")
+        _pre_gptq_model    = compressed_model
+        _pre_gptq_accuracy = current_accuracy
+        _gptq_result = apply_gptq_quantization(
+            copy.deepcopy(compressed_model),
+            dataloader=dataloader,
+            device=device,
+            bits=gptq_bits,
+            num_calibration_batches=gptq_cal_batches,
+            block_size=gptq_block_size,
+            # Only produce trainable (QAT/STE) GPTQ layers when a KD
+            # fine-tune is actually going to run afterward — that's the only
+            # thing that would ever use the shadow weight's trainability.
+            # Otherwise this is the plain frozen _Int4Linear, zero added
+            # overhead. Without this, the final KD step below could never
+            # touch a single GPTQ-quantized weight — see _Int4LinearQAT's
+            # docstring in compression.py.
+            qat=use_kd_finetune,
+        )
+        compressed_model, current_accuracy, _gptq_kept = gate_technique_accuracy(
+            f"GPTQ INT{gptq_bits}", _pre_gptq_model, _gptq_result, dataloader,
+            device, accuracy_drop_threshold, pre_accuracy=_pre_gptq_accuracy,
+        )
+        _gptq_report_data = getattr(_gptq_result, '_gptq_report', {}) or {}
+        _gptq_n_quantized  = _gptq_report_data.get('layers_quantized', 0)
+        _gptq_n_eligible   = _gptq_report_data.get('total_eligible_layers', 0)
+        _gptq_post_acc = (
+            current_accuracy if _gptq_kept
+            else measure_accuracy(_gptq_result, dataloader, device)
+        )
+        report_technique_impact(
+            f"GPTQ INT{gptq_bits}",
+            pre_model=_pre_gptq_model, post_model=_gptq_result,
+            pre_accuracy=_pre_gptq_accuracy, post_accuracy=_gptq_post_acc,
+            was_kept=_gptq_kept,
+            pre_device=device, post_device=device,
+            original_accuracy=baseline_acc, original_size_mb=baseline_size,
+            original_latency_ms=baseline_latency,
+            input_shape=input_shape, input_dtype=input_dtype,
+            structural_summary=(
+                f"{_gptq_n_quantized}/{_gptq_n_eligible} eligible Linear "
+                f"layer(s) quantized to INT{gptq_bits}"
+            ),
+            structural_zero=(_gptq_n_quantized == 0),
+        )
+        if not _gptq_kept:
+            # GPTQ was reverted — treat it as if it had never been requested
+            # for every downstream decision (dynamic-skip check, KD's qat
+            # wiring already happened at construction time and is harmless
+            # either way since collapse_qat_layers is unconditional below).
+            _use_gptq = False
+
+    # ── Standard Quantization (gated) ─────────────────────────────────────────
+    # Dynamic INT8 is skipped when GPTQ already ran on Linear layers —
+    # running both would discard GPTQ's Hessian correction (dynamic INT8
+    # would just re-round GPTQ's own INT4-corrected weights). UNLIKE
+    # run_compression_pipeline(), fp16 is NOT skipped when GPTQ is absent or
+    # reverted here — fp16-only remains a fully supported, independent
+    # configuration for compress(), by explicit request (see CHANGE LOG
+    # v1.2.2 above).
+    _skip_dynamic = _use_gptq and quant_mode == 'dynamic'
+
+    if use_quantization and not _skip_dynamic:
+        print(f"\n[compress] Phase B — Quantization ({quant_mode})...")
+        _pre_quant_model    = compressed_model
+        _pre_quant_accuracy = current_accuracy
+        quant_input = copy.deepcopy(compressed_model)
         if quant_mode == 'dynamic':
             quant_input = quant_input.cpu()
-        compressed_model = apply_quantization(
+        _quant_result = apply_quantization(
             quant_input,
             dataloader=dataloader,
             mode=quant_mode,
             num_calibration_batches=quant_cal_batches,
         )
+        _quant_eval_device = 'cpu' if quant_mode == 'dynamic' else device
+        compressed_model, current_accuracy, _quant_kept = gate_technique_accuracy(
+            f"Quantization ({quant_mode})", _pre_quant_model, _quant_result,
+            dataloader, _quant_eval_device, accuracy_drop_threshold,
+            pre_accuracy=_pre_quant_accuracy,
+        )
+        _quant_post_acc = (
+            current_accuracy if _quant_kept
+            else measure_accuracy(_quant_result, dataloader, _quant_eval_device)
+        )
+        report_technique_impact(
+            f"Quantization ({quant_mode})",
+            pre_model=_pre_quant_model, post_model=_quant_result,
+            pre_accuracy=_pre_quant_accuracy, post_accuracy=_quant_post_acc,
+            was_kept=_quant_kept,
+            pre_device=device, post_device=_quant_eval_device,
+            original_accuracy=baseline_acc, original_size_mb=baseline_size,
+            original_latency_ms=baseline_latency,
+            input_shape=input_shape, input_dtype=input_dtype,
+            structural_summary=f"all parameters cast to {quant_mode}",
+            structural_zero=False,
+        )
+        if _quant_kept:
+            _final_quant_is_dynamic = (quant_mode == 'dynamic')
+        # else: reverted — compressed_model is back to the pre-quant model,
+        # which never moved off `device`, so _final_quant_is_dynamic
+        # correctly stays False.
+    elif use_quantization and _skip_dynamic:
+        print(f"\n[compress] Skipping dynamic INT8 — GPTQ already ran on "
+              f"Linear layers. Use quant_mode='fp16' to also compress conv "
+              f"weights (or combine GPTQ+fp16 in one run).")
 
-    if use_gptq:
+    # ── Final KD recovery fine-tune (gated + cumulative-recovery retry) ──────
+    # Runs LAST — after GPTQ and standard Quantization — so it recovers
+    # accuracy lost to every prior step at once, matching what this
+    # function's own KD parameter docs already described (previously
+    # aspirational for compress() specifically — see CHANGE LOG v1.2.2).
+    if use_kd_finetune:
+        print(f"\n[compress] Phase B — KD Fine-tune ({kd_epochs} epoch(s), "
+              f"post-quantization)...")
+        _kd_device = 'cpu' if _final_quant_is_dynamic else device
+        _pre_kd_model    = compressed_model
+        _pre_kd_accuracy = current_accuracy
         try:
-            from sigularty.compression import apply_gptq_quantization as apply_gptq
-            print(f"\n[compress] GPTQ INT{gptq_bits}...")
-            compressed_model = apply_gptq(
-                compressed_model,
+            _kd_result = fine_tune_with_distillation(
+                student=compressed_model,
+                teacher=model,
                 dataloader=dataloader,
-                bits=gptq_bits,
-                num_calibration_batches=gptq_cal_batches,
-                block_size=gptq_block_size,
-                device=device,
+                num_classes=num_classes,
+                epochs=kd_epochs,
+                lr=kd_lr,
+                device=_kd_device,
+                temperature=kd_temperature,
+                alpha=kd_alpha,
+                max_batches=kd_max_batches,
+                test_loader=dataloader,
             )
         except Exception as exc:
-            print(f"  ⚠️  GPTQ failed ({exc}) — continuing without GPTQ.")
+            print(f"  ⚠️  KD fine-tune failed: {exc}")
+            _kd_result = None
+
+        if _kd_result is not None:
+            compressed_model, current_accuracy, _kd_kept = gate_technique_accuracy(
+                "KD Fine-tune", _pre_kd_model, _kd_result, dataloader, _kd_device,
+                accuracy_drop_threshold, pre_accuracy=_pre_kd_accuracy,
+            )
+            _pre_kd_size_mb = get_model_size_mb(_pre_kd_model)
+            _kd_post_acc = (
+                current_accuracy if _kd_kept
+                else measure_accuracy(_kd_result, dataloader, _kd_device)
+            )
+            report_technique_impact(
+                "KD Fine-tune (final)",
+                pre_model=_pre_kd_model, post_model=_kd_result,
+                pre_accuracy=_pre_kd_accuracy, post_accuracy=_kd_post_acc,
+                was_kept=_kd_kept,
+                pre_device=_kd_device, post_device=_kd_device,
+                original_accuracy=baseline_acc, original_size_mb=baseline_size,
+                original_latency_ms=baseline_latency,
+                input_shape=input_shape, input_dtype=input_dtype,
+                pre_size_mb=_pre_kd_size_mb,
+                structural_summary=(
+                    "n/a — recovers accuracy lost to every prior technique, "
+                    "no structural change of its own"
+                ),
+                structural_zero=False,
+            )
+
+            if _kd_kept:
+                # ── Cumulative recovery-quality check + one bounded retry ────
+                # Same "6d" heuristic run_compression_pipeline() uses: if the
+                # CUMULATIVE drop vs. the absolute original baseline still
+                # exceeds threshold even after KD's own marginal gate passed,
+                # inspect the per-epoch test-accuracy trend for exactly one
+                # bounded, LR-adjusted retry.
+                cumulative_drop = baseline_acc - current_accuracy
+                if cumulative_drop > accuracy_drop_threshold:
+                    _history = getattr(_kd_result, '_kd_history', [])
+                    _test_accs = [h['test_acc'] for h in _history if h.get('test_acc') is not None]
+                    _retry_lr: Optional[float] = None
+                    _retry_reason: Optional[str] = None
+
+                    if len(_test_accs) >= 2:
+                        _deltas = [_test_accs[i] - _test_accs[i - 1] for i in range(1, len(_test_accs))]
+                        _avg_delta = sum(_deltas) / len(_deltas)
+                        _all_positive = all(d > 0 for d in _deltas)
+                        if abs(_avg_delta) < 0.5:
+                            _retry_lr = kd_lr * 0.5
+                            _retry_reason = (
+                                f"stagnant (avg epoch-to-epoch change "
+                                f"{_avg_delta:+.2f}pp, |Δ|<0.5pp)"
+                            )
+                        elif _all_positive and _avg_delta < 2.0:
+                            _retry_lr = kd_lr * 1.5
+                            _retry_reason = (
+                                f"small constant increase (avg {_avg_delta:+.2f}pp/"
+                                f"epoch, <2pp)"
+                            )
+
+                    if _retry_lr is not None:
+                        print(
+                            f"\n  [KD Recovery] Cumulative accuracy drop "
+                            f"{cumulative_drop:.2f}pp still exceeds the "
+                            f"{accuracy_drop_threshold:.1f}pp threshold after KD. "
+                            f"Trend is {_retry_reason} — retrying ONCE with lr "
+                            f"{kd_lr:.2e} → {_retry_lr:.2e}, restarting fresh "
+                            f"from the pre-KD checkpoint. This result is "
+                            f"accepted unconditionally regardless of outcome — "
+                            f"no further retries.\n"
+                        )
+                        try:
+                            _retry_result = fine_tune_with_distillation(
+                                student=_pre_kd_model,
+                                teacher=model,
+                                dataloader=dataloader,
+                                num_classes=num_classes,
+                                epochs=kd_epochs,
+                                lr=_retry_lr,
+                                device=_kd_device,
+                                temperature=kd_temperature,
+                                alpha=kd_alpha,
+                                max_batches=kd_max_batches,
+                                test_loader=dataloader,
+                            )
+                            _pre_retry_accuracy = current_accuracy
+                            del compressed_model
+                            if _kd_device == 'cuda':
+                                torch.cuda.empty_cache()
+                            compressed_model = _retry_result
+                            current_accuracy = measure_accuracy(
+                                compressed_model, dataloader, _kd_device,
+                            )
+                            print(
+                                f"  [KD Recovery] Retry result: "
+                                f"{current_accuracy:.2f}% (was "
+                                f"{_pre_retry_accuracy:.2f}% before retry). "
+                                f"Accepting this result regardless of outcome — "
+                                f"if it is still not acceptable, try again with "
+                                f"different compression settings."
+                            )
+                        except Exception as exc:
+                            print(f"  ⚠️  KD recovery retry failed ({exc}) — "
+                                  f"keeping the pre-retry result.")
+                    else:
+                        print(
+                            f"\n  [KD Recovery] Cumulative accuracy drop "
+                            f"{cumulative_drop:.2f}pp still exceeds the "
+                            f"{accuracy_drop_threshold:.1f}pp threshold, but the "
+                            f"per-epoch trend doesn't match the stagnant/"
+                            f"small-increase retry conditions — accepting the "
+                            f"result as-is. Consider less aggressive "
+                            f"compression settings.\n"
+                        )
+
+    # ── Collapse any QAT-mode GPTQ layers back to frozen, compact form ───────
+    # Safe to call unconditionally: if QAT was never requested (no fine-tune
+    # was going to run, or GPTQ wasn't used at all), this just walks the
+    # model, finds zero _Int4LinearQAT instances, and returns unchanged.
+    compressed_model = collapse_qat_layers(compressed_model)
+    if _use_gptq and use_kd_finetune:
+        # Collapse reconstructs the exact same weight the QAT layer's own
+        # forward() was already computing, so this should not change
+        # accuracy — re-measuring anyway rather than trusting that by
+        # assumption, since this is the one point where the model's actual
+        # computation graph just changed shape. _kd_device is guaranteed set
+        # by this point: it's assigned unconditionally near the top of the
+        # `if use_kd_finetune:` block above, exactly the condition gating
+        # entry into this branch too.
+        current_accuracy = measure_accuracy(compressed_model, dataloader, _kd_device)
+
+    # ── Device for evaluating the final compressed model ──────────────────────
+    # fp16 stays on the main compute device; dynamic INT8 forces CPU (fbgemm).
+    # Uses _final_quant_is_dynamic (a tracked flag, see above) rather than
+    # re-deriving from quant_mode, because quantization gating can have
+    # reverted dynamic quant back to a GPU-resident fp32 model.
+    acc_device = 'cpu' if _final_quant_is_dynamic else device
+
+    # Re-apply fp16 if quantization mode is fp16 — fine_tune_with_distillation
+    # internally casts the student to float32 for stable training, so without
+    # this the reported size would equal the float32 baseline even though
+    # quant_mode='fp16' was requested. Only relevant when fp16 quantization
+    # actually survived its gate.
+    if use_quantization and quant_mode == 'fp16' and _quant_kept:
+        compressed_model = compressed_model.to(torch.float16)
+        current_accuracy = measure_accuracy(compressed_model, dataloader, acc_device)
+        print(f"\n  [fp16 recast] Re-measured accuracy after final fp16 cast: "
+              f"{current_accuracy:.2f}%")
 
     # ── Evaluate final compressed model ───────────────────────────────────────
-    # INT8 dynamic quant (fbgemm) must run on CPU; fp16 stays on GPU
-    acc_device = 'cpu' if (use_quantization and quant_mode == 'dynamic') else device
+    # current_accuracy already reflects the correctly-measured, final state
+    # from whichever gate/re-measurement above touched it last — reusing it
+    # here avoids a redundant measure_accuracy() call for an identical number.
     print(f"\n[compress] Evaluating compressed model (on {acc_device})...")
-    comp_acc  = measure_accuracy(compressed_model, dataloader, acc_device)
+    comp_acc  = current_accuracy
     comp_size = get_model_size_mb(compressed_model)
 
-    # ── What actually survived gating (if enabled — it is, by default, now) ──
-    # A technique that got reverted by apply_compression_pipeline's own
-    # accuracy gate must not be reported as "applied" — matches
-    # run_compression_pipeline's identical convention in helper_functions.py.
+    # ── What actually survived gating ─────────────────────────────────────────
+    # A technique that got reverted by its own accuracy gate must not be
+    # reported as "applied" — matches run_compression_pipeline's identical
+    # convention in helper_functions.py.
     _gating_report = getattr(compressed_pre_quant, '_gating_report', {})
     pruning_rep = getattr(compressed_pre_quant, '_pruning_report', None)
     _pruning_incompatible = bool((pruning_rep or {}).get('torch_pruning_incompatible', False))
 
     # ── Build techniques_applied ──────────────────────────────────────────────
+    # Order matches actual execution order:(BN Fusion → Pruning →
+    # LRF → Clustering → GPTQ → Quantization → final KD).
     techniques: List[str] = ['BN Fusion']
     if use_pruning and not _pruning_incompatible and _gating_report.get('Structured Pruning', True):
         techniques.append(f'Structured Pruning (ratio={pruning_ratio:.2f})')
@@ -655,12 +982,12 @@ def compress(
         techniques.append(f'Low-Rank Factorization ({tag})')
     if use_clustering and _gating_report.get('Weight Clustering', True):
         techniques.append(f'Weight Clustering (k={num_clusters})')
-    if use_kd_finetune and _gating_report.get('KD Fine-tune (in-pipeline)', True):
-        techniques.append(f'KD Fine-tune (T={kd_temperature:.1f}, α={kd_alpha:.2f})')
-    if use_quantization:
-        techniques.append(f'Quantization ({quant_mode})')
-    if use_gptq:
+    if _use_gptq:
         techniques.append(f'GPTQ INT{gptq_bits}')
+    if use_quantization and not _skip_dynamic and _quant_kept:
+        techniques.append(f'Quantization ({quant_mode})')
+    if use_kd_finetune and _kd_kept:
+        techniques.append(f'KD Fine-tune (T={kd_temperature:.1f}, α={kd_alpha:.2f})')
 
     # ── CQI ───────────────────────────────────────────────────────────────────
     cqi = compression_quality_index(

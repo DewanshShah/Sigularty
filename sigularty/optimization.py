@@ -478,6 +478,7 @@ def _ternary_search(
             print(f"    iter {iteration + 1}  {key_name}={r.get(key_name, val):.4f}  "
                   f"acc={r.get('accuracy', 0):.1f}%  score={score_val:.3f}")
 
+
         if s1 < s2:
             low = m1
         else:
