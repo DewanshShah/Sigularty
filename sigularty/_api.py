@@ -14,11 +14,11 @@ from __future__ import annotations
 import copy
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 
 # ============================================================================
@@ -72,10 +72,13 @@ class CompressionResult:
     accuracy_retention  (compressed_acc / original_acc) × 100.
                         96.4 means the compressed model achieves 96.4% of
                         the original model's accuracy, not an absolute number.
+                        Both accuracy values are measured on test_loader —
+                        a genuine held-out set — never on the data the model
+                        is fine-tuned on.
     size_original_mb    Original model size in MB.
     size_compressed_mb  Compressed model size in MB.
-    original_accuracy   Original model top-1 accuracy %.
-    compressed_accuracy Compressed model top-1 accuracy %.
+    original_accuracy   Original model top-1 accuracy % on test_loader.
+    compressed_accuracy Compressed model top-1 accuracy % on test_loader.
     original_latency_ms Mean inference latency (ms) of original model.
     compressed_latency_ms Mean inference latency (ms) of compressed model.
     latency_speedup     original_lat / compressed_lat. >1.0 = faster.
@@ -168,9 +171,8 @@ def load_from_registry(
     """
     Load a model AND its paired dataset from the registry in one call.
 
-    This is the SOLE supported entry point for registry-based loading (see
-    this file's module docstring — the older load_model_and_data() wrapper
-    that duplicated this has been removed).
+    This is the sole supported entry point for registry-based loading — see
+    this file's module docstring.
 
     Handles everything automatically:
       - Downloads the dataset paired with the model (CIFAR-10, CIFAR-100,
@@ -182,7 +184,8 @@ def load_from_registry(
     After calling this, you can pass the result directly into compress():
 
         r = load_from_registry('resnet50', device='cuda')
-        result = compress(r.model, r.train_loader, num_classes=r.num_classes)
+        result = compress(r.model, r.train_loader, test_loader=r.test_loader,
+                          num_classes=r.num_classes)
 
     Parameters
     ----------
@@ -274,6 +277,14 @@ def compress(
     model:      nn.Module,
     dataloader: DataLoader,
     *,
+    # ── Evaluation data ───────────────────────────────────────────────────────
+    # A genuine held-out set. Every accuracy measurement in this function —
+    # baseline, both hyperparameter searches, every technique's gate, the
+    # final report — reads accuracy from test_loader, never from dataloader.
+    # If you don't supply one, compress() derives one automatically by
+    # splitting dataloader's own dataset 70/30 (train/held-out, fixed seed)
+    # and prints a warning when it does — see _auto_split_dataloader below.
+    test_loader:             Optional[DataLoader] = None,
     # ── Device ────────────────────────────────────────────────────────────────
     device:                  Optional[str]   = None,
     # ── Model metadata ────────────────────────────────────────────────────────
@@ -284,7 +295,7 @@ def compress(
     # (e.g. freshly loaded from load_from_registry() with no checkpoint).
     pretrain_epochs:         int             = 0,      # 0 = skip pre-training
     pretrain_lr:             float           = 1e-3,
-    pretrain_test_loader:    Optional[DataLoader] = None,  # if None uses dataloader
+    pretrain_test_loader:    Optional[DataLoader] = None,  # if None uses test_loader
     # ── Hyperparameter searches (optional — adds evaluations before pipeline) ─
     find_optimal_epsilon:    bool            = False,
     find_optimal_pruning:    bool            = False,
@@ -293,18 +304,18 @@ def compress(
     pruning_search_ft_epochs: int            = 1,
     pruning_search_ft_lr:    float           = 1e-4,
     accuracy_drop_threshold: float           = 5.0,
-    # NEW — direct pp value, not a multiplier. After epoch 1 of Pruning's/
-    # LRF's own recovery fine-tune (both in the real pipeline AND their
-    # searches), abort the remaining epochs if the drop vs. the original
-    # baseline already exceeds this. None (default) = disabled, matching
-    # the previous unconditional behaviour. See _kd_recovery_fine_tune's
-    # docstring in compression.py for the full mechanism.
+    # Direct pp value, not a multiplier. After epoch 1 of Pruning's/LRF's own
+    # recovery fine-tune (both in the real pipeline and their searches), abort
+    # the remaining epochs if the drop vs. the original baseline already
+    # exceeds this. None (default) = disabled — every fine-tune runs to
+    # completion. See _kd_recovery_fine_tune's docstring in compression.py
+    # for the full mechanism.
     early_abort_threshold:   Optional[float] = None,
-    # NEW — explicit cache-path overrides for the two hyperparameter
-    # searches. None (default) = auto-derive a per-model path under
-    # .sigularty_cache/ (see _derive_cache_key below) so compressing two
-    # different models from the same working directory never silently
-    # shares (and corrupts) each other's cached trial results.
+    # Explicit cache-path overrides for the two hyperparameter searches. None
+    # (default) = auto-derive a per-model path under .sigularty_cache/ (see
+    # _derive_cache_key below) so compressing two different models from the
+    # same working directory never silently shares (and corrupts) each
+    # other's cached trial results.
     epsilon_cache_path:      Optional[str]   = None,
     pruning_cache_path:      Optional[str]   = None,
     # ── Technique enable flags ────────────────────────────────────────────────
@@ -317,13 +328,12 @@ def compress(
     # ── Pruning hyperparameters ───────────────────────────────────────────────
     pruning_ratio:           float           = 0.3,
     pruning_max_ratio:       float           = 0.95,
-    # NEW — ceiling specifically for auto-detected residual/skip-connection-
-    # coupled groups (the layers whose channel count IS the residual stream
-    # for an entire network stage). None (default) = fall back to
-    # pruning_max_ratio above, matching main.py's PRUNING_RESIDUAL_MAX_RATIO
-    # convention exactly. See _find_residual_coupled_groups() in
-    # compression.py and README.md's "Architecture-Agnostic Residual Group
-    # Detection" section.
+    # Ceiling specifically for auto-detected residual/skip-connection-coupled
+    # groups (the layers whose channel count IS the residual stream for an
+    # entire network stage). None (default) = fall back to pruning_max_ratio
+    # above, matching main.py's PRUNING_RESIDUAL_MAX_RATIO convention. See
+    # _find_residual_coupled_groups() in compression.py and README.md's
+    # "Architecture-Agnostic Residual Group Detection" section.
     pruning_residual_max_ratio: Optional[float] = None,
     pruning_model_type:      str             = 'classifier',
     pruning_fine_tune_epochs: int            = 3,
@@ -375,8 +385,9 @@ def compress(
     Parameters
     ----------
     model       : Any nn.Module.  Deep-copied internally.
-    dataloader  : DataLoader yielding (inputs, labels).  Used for calibration,
-                  fine-tuning, and evaluation.
+    dataloader  : DataLoader yielding (inputs, labels).  Used for calibration
+                  and fine-tuning throughout the pipeline. Never evaluated
+                  against directly — see test_loader.
 
     Returns
     -------
@@ -385,51 +396,53 @@ def compress(
 
     Notes
     -----
-    Latency is always measured in float32 on the target device (Phase A model)
-    so GPU vs GPU comparisons are fair.  Accuracy and size use the final
-    compressed model which may be INT8/fp16.
+    Evaluation happens on test_loader throughout — the baseline measurement,
+    both hyperparameter searches, every technique's accuracy gate, and the
+    final report. dataloader is reserved for calibration and fine-tuning. If
+    test_loader is not supplied, compress() derives one automatically by
+    splitting dataloader's dataset 70/30 (train/held-out) with a fixed seed,
+    so the model is never fine-tuned and then graded on the exact same
+    samples. See _auto_split_dataloader's docstring for the mechanics.
 
-    Accuracy-drop gating is always active across BOTH phases:
-    Structured Pruning, Low-Rank Factorization, and Weight Clustering
-    and GPTQ, standard Quantization, and the final KD recovery
-    fine-tune are each individually measured before/after and
-    reverted to their pre-technique state if that ONE technique's own
-    marginal accuracy drop exceeds accuracy_drop_threshold. A reverted
-    technique will not appear in the returned
+    Latency is always measured in float32 on the target device so GPU-vs-GPU
+    comparisons are fair.  Accuracy and size use the final compressed model,
+    which may be INT8/fp16.
+
+    Accuracy-drop gating is always active: Structured Pruning, Low-Rank
+    Factorization, and Weight Clustering, and GPTQ, standard Quantization,
+    and the final KD recovery fine-tune are each individually measured
+    before/after and reverted to their pre-technique state if that ONE
+    technique's own marginal accuracy drop exceeds accuracy_drop_threshold. A
+    reverted technique will not appear in the returned
     CompressionResult.techniques_applied. This matches
-    run_compression_pipeline()'s gating exactly, including:
+    run_compression_pipeline()'s gating, including:
       - QAT-aware GPTQ (apply_gptq_quantization(..., qat=use_kd_finetune))
-        so the final KD step can actually recover accuracy from
-        GPTQ-quantized weights via a straight-through estimator, rather
-        than finding them frozen;
+        so the final KD step can recover accuracy from GPTQ-quantized
+        weights via a straight-through estimator, rather than finding them
+        frozen;
       - collapse_qat_layers() afterward, shrinking those layers back to
         compact frozen INT4 storage once KD finishes;
       - one bounded, LR-adjusted retry if KD's cumulative recovery (vs. the
         absolute original baseline) still falls short of
         accuracy_drop_threshold after KD's own gate already passed.
     See apply_compression_pipeline() in compression.py,
-    run_compression_pipeline() in helper_functions.py (the reference this
-    mirrors), and "Global Accuracy-Drop Threshold & Per-Technique
-    Gating" in README.md for the full mechanism.
+    run_compression_pipeline() in helper_functions.py, and "Global
+    Accuracy-Drop Threshold & Per-Technique Gating" in README.md for the
+    full mechanism.
 
-    The KD fine-tune (use_kd_finetune) now ALWAYS runs after GPTQ/
-    Quantization — never inside — so it recovers accuracy lost to
-    every prior step at once, matching what this file's own KD parameter
-    docs already described. Earlier versions
-    ran KD inside, before quantization/GPTQ existed, so it could
-    never recover from their damage — this was the direct cause of an
-    ungated ~16pp accuracy drop surviving all the way to the returned
-    result in one real stress test.
+    The KD fine-tune (use_kd_finetune) runs after GPTQ and standard
+    quantization, never before, so it recovers accuracy lost to every prior
+    step at once.
 
     Search caches (epsilon_cache_path / pruning_cache_path): each search's
     trial-by-trial results are cached to disk purely by hyperparameter value
     (see find_optimal_epsilon_smart / find_optimal_pruning_params in
-    optimization.py), with no reference to which model produced them. By
-    default compress() now derives a per-model cache filename under
-    .sigularty_cache/ so two different models never silently share (and
-    corrupt) each other's cached numbers. Pass an explicit path yourself if
-    you need a stronger guarantee (e.g. distinct caches per dataset too, not
-    just per model/num_classes).
+    optimization.py), with no reference to which model or data split
+    produced them. compress() derives a per-model cache filename under
+    .sigularty_cache/ by default so two different models never silently
+    share (and corrupt) each other's cached numbers. Pass an explicit path
+    yourself if you need a stronger guarantee (e.g. distinct caches per
+    dataset too, not just per model/num_classes).
     """
     # ── Deferred imports ────────────────────────────────
     from sigularty.compression import (
@@ -463,6 +476,14 @@ def compress(
         print("  ⚠️  fp16 requested but device=cpu — switching to dynamic INT8.")
         quant_mode = 'dynamic'
 
+    # ── Evaluation data — resolve test_loader before anything touches the
+    #    data, including the optional pre-training step below. If pretrain
+    #    trained on data that later gets called "held out", every downstream
+    #    measurement against that data would be contaminated the same way
+    #    the whole rest of this fix exists to prevent. ─────────────────────────
+    if test_loader is None:
+        dataloader, test_loader = _auto_split_dataloader(dataloader)
+
     # ── Optional: pre-train on target dataset before compressing ────────────
     # This is needed when a freshly loaded model has a randomly initialised
     # head (ImageNet weights + untrained classifier = ~1% accuracy).
@@ -470,7 +491,7 @@ def compress(
         print(f"\n[compress] Pre-training for {pretrain_epochs} epoch(s) "
               f"(lr={pretrain_lr}) before compressing...")
         from sigularty.helper_functions import train_model as _train_model
-        _test_loader = pretrain_test_loader if pretrain_test_loader is not None else dataloader
+        _test_loader = pretrain_test_loader if pretrain_test_loader is not None else test_loader
         model = _train_model(
             model=model,
             train_loader=dataloader,
@@ -490,11 +511,12 @@ def compress(
     model.to(device)
 
     baseline_size     = get_model_size_mb(model)
-    baseline_acc      = measure_accuracy(model, dataloader, device)
-    # Infers BOTH shape and dtype from the first batch (previously shape
-    # only) — see _infer_input_shape_and_dtype's docstring for why an NLP
-    # model silently had every latency measurement default to a float32
-    # vision dummy input without this.
+    baseline_acc      = measure_accuracy(model, test_loader, device)
+    # Infers both shape and dtype from the first batch, since latency
+    # measurement needs a dummy input of the right kind (int64 token IDs
+    # for NLP models, float32 pixels for vision) — shape/dtype don't depend
+    # on which subset of samples this comes from, so dataloader (train side)
+    # is just as good a source for this as test_loader would be.
     input_shape, input_dtype = _infer_input_shape_and_dtype(model, dataloader, device)
     baseline_latency  = measure_latency(
         model, input_shape, device, num_iterations=50, warmup=5,
@@ -513,7 +535,7 @@ def compress(
         print(f"  Cache: '{_eps_cache_path}'")
         best_eps, _, _ = find_optimal_epsilon_smart(
             model=model,
-            test_loader=dataloader,
+            test_loader=test_loader,
             device=device,
             baseline_accuracy=baseline_acc,
             baseline_size=baseline_size,
@@ -542,7 +564,7 @@ def compress(
         best_cfg, _, _ = find_optimal_pruning_params(
             model=model,
             dataloader=dataloader,
-            test_loader=dataloader,
+            test_loader=test_loader,
             device=device,
             baseline_accuracy=baseline_acc,
             baseline_size=baseline_size,
@@ -572,14 +594,13 @@ def compress(
                   f"max_ratio={pruning_max_ratio:.2f}  "
                   f"steps={pruning_iterative_steps}")
 
-    # ── Phase A: Structural compression (float32) ─────────────────────────────
-    # BN Fusion, Pruning, LRF, Clustering.
-    # Quantization is deferred — quantized tensors (qint8) have no CUDA kernel,
-    # making GPU latency comparisons unfair.
-    # use_kd_finetune=False is now ALWAYS passed here— the KD
-    # fine-tune runs exactly once, so it can recover
-    # accuracy lost to quantization/GPTQ too.
-    print("\n[compress] Phase A: Structural compression...")
+    # ── Structural compression (float32) ───────────────────────────────────────
+    # BN Fusion, Pruning, LRF, Clustering. Quantization is deferred:
+    # quantized tensors (qint8) have no CUDA kernel, which would make GPU
+    # latency comparisons unfair. KD fine-tuning is also deferred so it runs
+    # exactly once, after quantization/GPTQ, and can recover accuracy lost
+    # to all of them at once rather than just to the structural changes.
+    print("\n[compress] Structural compression...")
     compressed_pre_quant = apply_compression_pipeline(
         model=model,
         dataloader=dataloader,
@@ -588,9 +609,9 @@ def compress(
         use_pruning=use_pruning,
         use_low_rank=use_lrf,
         use_clustering=use_clustering,
-        use_kd_finetune=False,          
-        use_quantization=False,         
-        use_gptq=False,                 
+        use_kd_finetune=False,
+        use_quantization=False,
+        use_gptq=False,
         pruning_ratio=pruning_ratio,
         pruning_model_type=pruning_model_type,
         pruning_num_classes=num_classes,
@@ -619,15 +640,12 @@ def compress(
         kd_temperature=kd_temperature,
         kd_alpha=kd_alpha,
         kd_num_classes=num_classes,
-        # ── Per-technique accuracy gating ───────────────────────────────
-        # Previously test_loader was never passed here, so _gating_enabled
-        # was False for the entire run: Structured Pruning, LRF, Weight
-        # Clustering, and the in-pipeline KD step could each silently
-        # devastate accuracy with nothing measuring, reverting, or even
-        # warning about it. See README.md's "Global Accuracy-Drop Threshold
-        # & Per-Technique Gating" section for the full mechanism this now
-        # activates.
-        test_loader=dataloader,
+        # Per-technique accuracy gating: with test_loader supplied, every
+        # mutating technique here (Structured Pruning, LRF, Weight
+        # Clustering) is measured before/after and reverted if its own
+        # marginal drop exceeds accuracy_drop_threshold. See README.md's
+        # "Global Accuracy-Drop Threshold & Per-Technique Gating" section.
+        test_loader=test_loader,
         accuracy_drop_threshold=accuracy_drop_threshold,
         early_abort_threshold=early_abort_threshold,
         original_size_mb=baseline_size,
@@ -636,28 +654,26 @@ def compress(
         input_dtype=input_dtype,
     )
 
-    # Latency measured on float32 Phase-A model — GPU vs GPU, apples-to-apples
+    # Latency measured on float32 model — GPU vs GPU, apples-to-apples
     comp_latency = measure_latency(
         compressed_pre_quant, input_shape, device, num_iterations=50, warmup=5,
         input_dtype=input_dtype,
     )['mean_ms']
 
     # current_accuracy is threaded through the entire rest of this function —
-    # every gate below reads/updates it, exactly mirroring
-    # run_compression_pipeline()'s own current_accuracy variable. Phase A's
-    # own gating (test_loader was passed above, so gating was active) already
-    # measured this as ._gating_accuracy; reusing it avoids a redundant
+    # every gate below reads/updates it, mirroring run_compression_pipeline()'s
+    # own current_accuracy variable in helper_functions.py. The structural
+    # compression step above already measured this as ._gating_accuracy (since
+    # test_loader was passed in); reusing it avoids a redundant
     # measure_accuracy() call for an identical number.
     current_accuracy = getattr(compressed_pre_quant, '_gating_accuracy', baseline_acc)
 
-    # ── Phase B: GPTQ → Quantization → final KD recovery (all gated) ─────────
-    # Mirrors run_compression_pipeline()'s Phase B (helper_functions.py)
-    # closely — see this file's CHANGE LOG (v1.2.2) above for exactly what
-    # changed and why. GPTQ and standard Quantization are each individually
-    # measured before/after and reverted on their own marginal accuracy drop;
-    # the final KD recovery fine-tune runs LAST, after both, so it can
-    # recover accuracy lost to quantization/GPTQ too — not just to Phase A's
-    # structural changes.
+    # ── GPTQ → Quantization → final KD recovery (all gated) ───────────────────
+    # GPTQ and standard Quantization are each individually measured before/
+    # after and reverted on their own marginal accuracy drop; the final KD
+    # recovery fine-tune runs last, after both, so it can recover accuracy
+    # lost to quantization/GPTQ too — not just to the earlier structural
+    # changes.
     compressed_model = compressed_pre_quant
 
     # Tracks whether the FINAL compressed_model ended up as a dynamic-INT8
@@ -672,7 +688,7 @@ def compress(
 
     # ── GPTQ (gated) ───────────────────────────────────────────────────────────
     if _use_gptq:
-        print(f"\n[compress] Phase B — GPTQ INT{gptq_bits}...")
+        print(f"\n[compress] GPTQ INT{gptq_bits}...")
         _pre_gptq_model    = compressed_model
         _pre_gptq_accuracy = current_accuracy
         _gptq_result = apply_gptq_quantization(
@@ -683,16 +699,14 @@ def compress(
             num_calibration_batches=gptq_cal_batches,
             block_size=gptq_block_size,
             # Only produce trainable (QAT/STE) GPTQ layers when a KD
-            # fine-tune is actually going to run afterward — that's the only
-            # thing that would ever use the shadow weight's trainability.
+            # fine-tune is actually going to run afterward — that's the
+            # only thing that would ever use shadow_weight's trainability.
             # Otherwise this is the plain frozen _Int4Linear, zero added
-            # overhead. Without this, the final KD step below could never
-            # touch a single GPTQ-quantized weight — see _Int4LinearQAT's
-            # docstring in compression.py.
+            # overhead. See _Int4LinearQAT's docstring in compression.py.
             qat=use_kd_finetune,
         )
         compressed_model, current_accuracy, _gptq_kept = gate_technique_accuracy(
-            f"GPTQ INT{gptq_bits}", _pre_gptq_model, _gptq_result, dataloader,
+            f"GPTQ INT{gptq_bits}", _pre_gptq_model, _gptq_result, test_loader,
             device, accuracy_drop_threshold, pre_accuracy=_pre_gptq_accuracy,
         )
         _gptq_report_data = getattr(_gptq_result, '_gptq_report', {}) or {}
@@ -700,7 +714,7 @@ def compress(
         _gptq_n_eligible   = _gptq_report_data.get('total_eligible_layers', 0)
         _gptq_post_acc = (
             current_accuracy if _gptq_kept
-            else measure_accuracy(_gptq_result, dataloader, device)
+            else measure_accuracy(_gptq_result, test_loader, device)
         )
         report_technique_impact(
             f"GPTQ INT{gptq_bits}",
@@ -727,15 +741,13 @@ def compress(
     # ── Standard Quantization (gated) ─────────────────────────────────────────
     # Dynamic INT8 is skipped when GPTQ already ran on Linear layers —
     # running both would discard GPTQ's Hessian correction (dynamic INT8
-    # would just re-round GPTQ's own INT4-corrected weights). UNLIKE
-    # run_compression_pipeline(), fp16 is NOT skipped when GPTQ is absent or
-    # reverted here — fp16-only remains a fully supported, independent
-    # configuration for compress(), by explicit request (see CHANGE LOG
-    # v1.2.2 above).
+    # would just re-round GPTQ's own INT4-corrected weights). fp16 is NOT
+    # skipped when GPTQ is absent or reverted here — fp16-only remains a
+    # fully supported, independent configuration for compress().
     _skip_dynamic = _use_gptq and quant_mode == 'dynamic'
 
     if use_quantization and not _skip_dynamic:
-        print(f"\n[compress] Phase B — Quantization ({quant_mode})...")
+        print(f"\n[compress] Quantization ({quant_mode})...")
         _pre_quant_model    = compressed_model
         _pre_quant_accuracy = current_accuracy
         quant_input = copy.deepcopy(compressed_model)
@@ -750,12 +762,12 @@ def compress(
         _quant_eval_device = 'cpu' if quant_mode == 'dynamic' else device
         compressed_model, current_accuracy, _quant_kept = gate_technique_accuracy(
             f"Quantization ({quant_mode})", _pre_quant_model, _quant_result,
-            dataloader, _quant_eval_device, accuracy_drop_threshold,
+            test_loader, _quant_eval_device, accuracy_drop_threshold,
             pre_accuracy=_pre_quant_accuracy,
         )
         _quant_post_acc = (
             current_accuracy if _quant_kept
-            else measure_accuracy(_quant_result, dataloader, _quant_eval_device)
+            else measure_accuracy(_quant_result, test_loader, _quant_eval_device)
         )
         report_technique_impact(
             f"Quantization ({quant_mode})",
@@ -780,12 +792,10 @@ def compress(
               f"weights (or combine GPTQ+fp16 in one run).")
 
     # ── Final KD recovery fine-tune (gated + cumulative-recovery retry) ──────
-    # Runs LAST — after GPTQ and standard Quantization — so it recovers
-    # accuracy lost to every prior step at once, matching what this
-    # function's own KD parameter docs already described (previously
-    # aspirational for compress() specifically — see CHANGE LOG v1.2.2).
+    # Runs last — after GPTQ and standard Quantization — so it recovers
+    # accuracy lost to every prior step at once.
     if use_kd_finetune:
-        print(f"\n[compress] Phase B — KD Fine-tune ({kd_epochs} epoch(s), "
+        print(f"\n[compress] KD Fine-tune ({kd_epochs} epoch(s), "
               f"post-quantization)...")
         _kd_device = 'cpu' if _final_quant_is_dynamic else device
         _pre_kd_model    = compressed_model
@@ -802,7 +812,7 @@ def compress(
                 temperature=kd_temperature,
                 alpha=kd_alpha,
                 max_batches=kd_max_batches,
-                test_loader=dataloader,
+                test_loader=test_loader,
             )
         except Exception as exc:
             print(f"  ⚠️  KD fine-tune failed: {exc}")
@@ -810,13 +820,13 @@ def compress(
 
         if _kd_result is not None:
             compressed_model, current_accuracy, _kd_kept = gate_technique_accuracy(
-                "KD Fine-tune", _pre_kd_model, _kd_result, dataloader, _kd_device,
+                "KD Fine-tune", _pre_kd_model, _kd_result, test_loader, _kd_device,
                 accuracy_drop_threshold, pre_accuracy=_pre_kd_accuracy,
             )
             _pre_kd_size_mb = get_model_size_mb(_pre_kd_model)
             _kd_post_acc = (
                 current_accuracy if _kd_kept
-                else measure_accuracy(_kd_result, dataloader, _kd_device)
+                else measure_accuracy(_kd_result, test_loader, _kd_device)
             )
             report_technique_impact(
                 "KD Fine-tune (final)",
@@ -837,11 +847,10 @@ def compress(
 
             if _kd_kept:
                 # ── Cumulative recovery-quality check + one bounded retry ────
-                # Same "6d" heuristic run_compression_pipeline() uses: if the
-                # CUMULATIVE drop vs. the absolute original baseline still
-                # exceeds threshold even after KD's own marginal gate passed,
-                # inspect the per-epoch test-accuracy trend for exactly one
-                # bounded, LR-adjusted retry.
+                # If the CUMULATIVE drop vs. the absolute original baseline
+                # still exceeds threshold even after KD's own marginal gate
+                # passed, inspect the per-epoch test-accuracy trend for
+                # exactly one bounded, LR-adjusted retry.
                 cumulative_drop = baseline_acc - current_accuracy
                 if cumulative_drop > accuracy_drop_threshold:
                     _history = getattr(_kd_result, '_kd_history', [])
@@ -889,7 +898,7 @@ def compress(
                                 temperature=kd_temperature,
                                 alpha=kd_alpha,
                                 max_batches=kd_max_batches,
-                                test_loader=dataloader,
+                                test_loader=test_loader,
                             )
                             _pre_retry_accuracy = current_accuracy
                             del compressed_model
@@ -897,7 +906,7 @@ def compress(
                                 torch.cuda.empty_cache()
                             compressed_model = _retry_result
                             current_accuracy = measure_accuracy(
-                                compressed_model, dataloader, _kd_device,
+                                compressed_model, test_loader, _kd_device,
                             )
                             print(
                                 f"  [KD Recovery] Retry result: "
@@ -935,7 +944,7 @@ def compress(
         # by this point: it's assigned unconditionally near the top of the
         # `if use_kd_finetune:` block above, exactly the condition gating
         # entry into this branch too.
-        current_accuracy = measure_accuracy(compressed_model, dataloader, _kd_device)
+        current_accuracy = measure_accuracy(compressed_model, test_loader, _kd_device)
 
     # ── Device for evaluating the final compressed model ──────────────────────
     # fp16 stays on the main compute device; dynamic INT8 forces CPU (fbgemm).
@@ -951,7 +960,7 @@ def compress(
     # actually survived its gate.
     if use_quantization and quant_mode == 'fp16' and _quant_kept:
         compressed_model = compressed_model.to(torch.float16)
-        current_accuracy = measure_accuracy(compressed_model, dataloader, acc_device)
+        current_accuracy = measure_accuracy(compressed_model, test_loader, acc_device)
         print(f"\n  [fp16 recast] Re-measured accuracy after final fp16 cast: "
               f"{current_accuracy:.2f}%")
 
@@ -972,8 +981,8 @@ def compress(
     _pruning_incompatible = bool((pruning_rep or {}).get('torch_pruning_incompatible', False))
 
     # ── Build techniques_applied ──────────────────────────────────────────────
-    # Order matches actual execution order:(BN Fusion → Pruning →
-    # LRF → Clustering → GPTQ → Quantization → final KD).
+    # Order matches actual execution order: BN Fusion → Pruning → LRF →
+    # Clustering → GPTQ → Quantization → final KD.
     techniques: List[str] = ['BN Fusion']
     if use_pruning and not _pruning_incompatible and _gating_report.get('Structured Pruning', True):
         techniques.append(f'Structured Pruning (ratio={pruning_ratio:.2f})')
@@ -1024,7 +1033,7 @@ def compress(
                 compressed_model=compressed_model,
                 metrics_dict=metrics_dict,
                 save_path=report_path,
-                dataloader=dataloader,
+                dataloader=test_loader,
                 device=acc_device,
             )
             out_report_path = os.path.abspath(report_path)
@@ -1169,7 +1178,9 @@ def finetune(
     ----------
     model        : Any nn.Module. Modified in-place AND returned.
     train_loader : DataLoader for training.
-    test_loader  : DataLoader for validation. If None, uses train_loader.
+    test_loader  : DataLoader for validation. If None, uses train_loader —
+                   pass a genuine held-out loader if you want this
+                   function's own per-epoch test_acc to mean anything.
     num_classes  : Output class count (for accuracy metric).
     epochs       : Number of training epochs. 5-15 recommended for transfer learning.
     lr           : Learning rate. 1e-3 is a safe default for Adam with a new head.
@@ -1188,7 +1199,8 @@ def finetune(
     >>> r = load_from_registry('resnet50')
     >>> model = finetune(r.model, r.train_loader, test_loader=r.test_loader,
     ...                  num_classes=r.num_classes, epochs=10)
-    >>> result = compress(model, r.train_loader, num_classes=r.num_classes)
+    >>> result = compress(model, r.train_loader, test_loader=r.test_loader,
+    ...                   num_classes=r.num_classes)
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1240,7 +1252,10 @@ def analyze(
     Parameters
     ----------
     model       : Any nn.Module.
-    dataloader  : Optional. If provided, top-1 accuracy is measured.
+    dataloader  : Optional. If provided, top-1 accuracy is measured against
+                  it — pass a held-out loader if you want that number to
+                  reflect generalisation rather than whatever the model has
+                  already been trained on.
     device      : 'cuda' or 'cpu'. Auto-detected when None.
 
     Returns
@@ -1371,28 +1386,15 @@ def _infer_input_shape_and_dtype(
     """
     Return (input_shape, input_dtype) from the first dataloader batch.
 
-    input_shape:  (1, ...) — a single-example shape. Same contract the old
-                  _infer_input_shape (now replaced by this function) had.
+    input_shape:  (1, ...) — a single-example shape.
     input_dtype:  the batch's own dtype — torch.long for NLP token-ID
                   inputs, torch.float32 for vision pixels, etc. Needed so
                   every per-technique impact report's latency measurement
                   (measure_latency's input_dtype param) builds a dummy
-                  input of the right kind. Previously compress() only
-                  inferred shape and never passed dtype anywhere, so
-                  compressing an NLP model through this function meant
-                  every latency measurement (baseline, both searches,
-                  Phase A) silently built a float32 (1,3,224,224) dummy
-                  input regardless of the model — a 4D-vs-2D shape
-                  mismatch deep inside the model's own forward pass,
-                  caught by broad except-and-fall-back-to-1.0ms handlers
-                  and never surfaced as an actual error. Same bug class
-                  helper_functions.py's run_compression_pipeline already
-                  fixed once for the main.py path; this is the equivalent
-                  fix for the compress() path.
+                  input of the right kind.
 
     Falls back to ((1, 3, 224, 224), None) if the batch cannot be read —
-    matching the old function's fallback shape, with None dtype
-    (measure_latency's own float32 default) as the safest fallback.
+    matching measure_latency's own float32 default for the dtype.
     """
     try:
         x, _ = next(iter(dataloader))
@@ -1401,35 +1403,138 @@ def _infer_input_shape_and_dtype(
         return (1, 3, 224, 224), None
 
 
+def _auto_split_dataloader(
+    dataloader: DataLoader,
+    train_frac: float = 0.7,
+    seed: int = 42,
+    small_test_warning_threshold: int = 100,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Split dataloader's underlying dataset into a train subset and a held-out
+    test subset, wrapping each in a fresh DataLoader.
+
+    Used by compress() when the caller doesn't supply test_loader. Without
+    this, every accuracy measurement in compress() — baseline, both
+    hyperparameter searches, every technique's gate, the final report —
+    would read accuracy off the exact same data the model is being
+    fine-tuned on, which stops being a meaningful signal the moment the
+    model can re-memorize that data (trivial for most models on the small
+    calibration sets typically used during compression).
+
+    The split uses a fixed seed so the same dataloader always produces the
+    same train/test split across repeated compress() calls on the same
+    data — otherwise two runs of an identical configuration could disagree
+    purely because they happened to draw a different 30%.
+
+    This is a plain random split, not stratified by label — on a dataset
+    with many classes and few samples per class, the resulting test split
+    can by chance under-represent or entirely miss some classes, making its
+    accuracy noisier than the sample count alone suggests. The split still
+    proceeds regardless; small_test_warning_threshold only controls when an
+    extra warning about that noise gets printed.
+
+    The new loaders inherit batch_size, num_workers, and pin_memory from
+    the original dataloader. The train split is shuffled; the test split
+    isn't.
+
+    Args:
+        dataloader: Original DataLoader. Its .dataset is what gets split;
+                    the DataLoader object itself is not reused directly.
+        train_frac: Fraction of samples assigned to the train split.
+        seed:       Fixed seed for the split, for reproducibility.
+        small_test_warning_threshold: If the resulting test split has fewer
+                    samples than this, an additional warning is printed
+                    calling out that the resulting accuracy read will be
+                    noisy. The split still proceeds either way.
+
+    Returns:
+        (train_loader, test_loader)
+
+    Raises:
+        ValueError: If the dataset doesn't support len() (e.g. an
+                    IterableDataset), or has fewer than 2 samples.
+    """
+    dataset = dataloader.dataset
+
+    if not hasattr(dataset, '__len__'):
+        raise ValueError(
+            "compress() couldn't auto-split dataloader's dataset because it "
+            "doesn't implement __len__ (e.g. an IterableDataset). Pass a "
+            "genuine held-out test_loader explicitly instead."
+        )
+
+    n = len(dataset)
+    if n < 2:
+        raise ValueError(
+            f"compress() couldn't auto-split dataloader's dataset — it only "
+            f"has {n} sample(s), not enough to form a train/test split. Pass "
+            f"a genuine held-out test_loader explicitly instead."
+        )
+
+    train_size = max(1, min(n - 1, round(train_frac * n)))
+    test_size  = n - train_size
+
+    generator = torch.Generator().manual_seed(seed)
+    train_subset, test_subset = random_split(
+        dataset, [train_size, test_size], generator=generator,
+    )
+
+    batch_size  = dataloader.batch_size or 32
+    num_workers = dataloader.num_workers
+
+    train_loader = DataLoader(
+        train_subset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers,
+    )
+    test_loader = DataLoader(
+        test_subset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers,
+    )
+
+    print(
+        f"\n  ⚠️  [compress] No test_loader supplied — auto-splitting "
+        f"dataloader's dataset {train_frac:.0%}/{1 - train_frac:.0%}: "
+        f"{train_size} train / {test_size} test (seed={seed}). Every "
+        f"accuracy check in this run — baseline, searches, every "
+        f"technique's gate, the final report — reads accuracy off this "
+        f"held-out {test_size}, never off the data the model fine-tunes "
+        f"on. Pass test_loader explicitly to use your own held-out set "
+        f"instead."
+    )
+    if test_size < small_test_warning_threshold:
+        print(
+            f"  ⚠️  [compress] The held-out split is only {test_size} "
+            f"sample(s) — below the {small_test_warning_threshold}-sample "
+            f"threshold this warns at. Expect a noisy accuracy read; "
+            f"individual technique gate decisions may be unreliable with "
+            f"a set this small. Pass a larger test_loader if you can."
+        )
+
+    return train_loader, test_loader
+
+
 def _derive_cache_key(model: nn.Module, num_classes: int) -> str:
     """
     Build a filename-safe, per-model cache-key string for the epsilon and
     pruning search caches.
 
-    WHY THIS EXISTS: find_optimal_epsilon_smart / find_optimal_pruning_params
-    (optimization.py) cache every trial result to disk purely by
-    hyperparameter value — e.g. str(round(epsilon, 4)), or a
-    "{ratio}|{max_ratio}|{epochs}|{lr}|{steps}" compound string. Neither key
-    has any reference to WHICH MODEL produced that result. compress()
-    previously always passed the SAME hardcoded cache filenames
-    ("epsilon_cache.json", "pruning_search_cache.json") regardless of which
-    model was being compressed — so running compress() on two different
-    models from the same working directory silently reused (and appeared
-    to "search" against) whichever model's numbers happened to already be
-    cached under that hyperparameter value. This is exactly what produced
-    an epsilon search reporting a flat ~0.10 MB across every single epsilon
-    from 0.17 to 0.83 for a 90 MB ResNet-50: those were a smaller, unrelated
-    cached model's numbers, not real evaluations of the ResNet-50 at all.
+    find_optimal_epsilon_smart / find_optimal_pruning_params (optimization.py)
+    cache every trial result to disk purely by hyperparameter value — e.g.
+    str(round(epsilon, 4)), or a "{ratio}|{max_ratio}|{epochs}|{lr}|{steps}"
+    compound string. Neither key has any reference to which model produced
+    that result, so two different models compressed from the same working
+    directory need separate cache files, or one would silently read back
+    the other's numbers under a matching hyperparameter value.
 
     This derives a string from things that are cheap to compute and differ
     across genuinely different models (class name + total parameter count +
-    output class count), so the SAME model reliably reuses its own cache
-    across repeated compress() calls (preserving the intended crash-recovery
-    behaviour documented in optimization.py's module docstring) while a
-    DIFFERENT model gets its own, separate file under .sigularty_cache/.
+    output class count), so the same model reliably reuses its own cache
+    across repeated compress() calls (the crash-recovery behaviour documented
+    in optimization.py's module docstring), while a different model gets its
+    own, separate file under .sigularty_cache/.
 
-    Not a cryptographic or collision-proof hash — just enough to catch the
-    exact failure mode that actually happened. Pass epsilon_cache_path /
+    Not a cryptographic or collision-proof hash — just enough to keep
+    different models' caches from colliding. Pass epsilon_cache_path /
     pruning_cache_path explicitly to compress() if you need a stronger
     guarantee (e.g. distinct caches per dataset too, not just per model).
     """
@@ -1467,7 +1572,9 @@ def plot_compression_report(
     result          : CompressionResult returned by compress().
     original_model  : The original uncompressed model (needed for side-by-side
                       comparisons in the report).
-    dataloader      : DataLoader used during compression (for any missing metrics).
+    dataloader      : DataLoader used for any missing metrics — pass the
+                      same test_loader you used for compress() if you want
+                      any fallback measurements to stay consistent with it.
     save_path       : Output PNG path. Default 'compression_report.png'.
     device          : Device for metric fallback computation. Auto-detected.
     show_in_notebook: If True and running in Jupyter/Colab, displays the image
@@ -1479,8 +1586,8 @@ def plot_compression_report(
 
     Example
     -------
-    >>> result = compress(model, dataloader)
-    >>> plot_compression_report(result, model, dataloader)
+    >>> result = compress(model, dataloader, test_loader=test_loader)
+    >>> plot_compression_report(result, model, test_loader)
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1550,7 +1657,7 @@ def plot_pruning_report(
 
     Example
     -------
-    >>> result = compress(model, dataloader, use_pruning=True)
+    >>> result = compress(model, dataloader, test_loader=test_loader, use_pruning=True)
     >>> plot_pruning_report(result)
     """
     if result.pruning_report is None:

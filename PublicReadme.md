@@ -3,8 +3,8 @@
 This is a quick reference for calling sigularty as a library: how to
 import it, the two ways to get a model in, and what every `compress()`
 argument does. For the theory behind each technique, why pruning runs
-before LRF, what CQI means, why quantization is always last, see
-[README.md].
+before LRF, what CQI means, why quantization runs before the final
+recovery step, see [README.md].
 
 ---
 
@@ -26,6 +26,7 @@ r = load_from_registry('resnet18', device='cuda')
 result = compress(
     r.model,
     r.train_loader,
+    test_loader=r.test_loader,
     num_classes=r.num_classes,
     use_pruning=True,
     use_lrf=True,
@@ -42,14 +43,20 @@ compressed_model = result.model
 ```python
 from sigularty import compress
 
-result = compress(model, train_loader, num_classes=num_classes)
+result = compress(model, train_loader, test_loader=test_loader, num_classes=num_classes)
 compressed_model = result.model
 ```
 
 `model` can be any `nn.Module`. `dataloader` (positional, second argument)
-is used for calibration, fine-tuning, and evaluation throughout the
-pipeline: it's never optional. The original model is never modified;
-`compress()` always works on a deep copy.
+is used for calibration and fine-tuning throughout the pipeline: it's
+never optional. `test_loader` is a genuine held-out set used for every
+accuracy measurement — baseline, both hyperparameter searches, every
+technique's gate, the final report. If you omit it, `compress()`
+auto-splits `dataloader`'s dataset 70/30 and prints a warning when it
+does; passing your own is always preferable, since the auto-split both
+reduces how much data your model actually gets fine-tuned on and can't
+guarantee class balance in the held-out portion. The original model is
+never modified; `compress()` always works on a deep copy.
 
 ---
 
@@ -70,9 +77,9 @@ from sigularty import (
 
 | Function | Signature | Returns |
 |---|---|---|
-| `analyze(model, dataloader=None, *, device=None)` | Inspects a model without modifying it. | `AnalysisResult` |
-| `load_from_registry(model_name, *, device=None, train_sample=None, test_sample=500, batch_size=32, model_path=None, force_retrain=False, pretrain_epochs=10, pretrain_lr=1e-4)` | See list of registry model names below. Sole supported registry entry point (see v1.2.0 note above). | `RegistryResult` |
-| `finetune(model, train_loader, *, test_loader=None, num_classes=10, epochs=10, lr=1e-3, max_batches=0, device=None, save_path=None)` | Fine-tunes in place and returns the same object. | `nn.Module` |
+| `analyze(model, dataloader=None, *, device=None)` | Inspects a model without modifying it. Pass a held-out `dataloader` if you want the reported accuracy to reflect generalisation rather than whatever the model has already been trained on. | `AnalysisResult` |
+| `load_from_registry(model_name, *, device=None, train_sample=None, test_sample=500, batch_size=32, model_path=None, force_retrain=False, pretrain_epochs=10, pretrain_lr=1e-4)` | See list of registry model names below. Sole supported registry entry point. | `RegistryResult` |
+| `finetune(model, train_loader, *, test_loader=None, num_classes=10, epochs=10, lr=1e-3, max_batches=0, device=None, save_path=None)` | Fine-tunes in place and returns the same object. `test_loader` defaults to `train_loader` if omitted — pass a genuine held-out loader if you want the per-epoch `test_acc` it prints to mean anything. | `nn.Module` |
 | `find_best_lr(model, dataloader, *, device=None, num_classes=10, start_lr=1e-7, end_lr=10.0, num_steps=100)` | LR range test; run before `finetune()` or `pretrain_epochs > 0`. | `float` |
 
 Registry model names (pass as `model_name`): `custom_cnn`, `resnet18`,
@@ -103,6 +110,12 @@ result.report_path             # path to the saved PNG report, or None
 result.pruning_report          # dict of per-layer pruning detail, or None (also None if pruning ran but was reverted by the gate)
 ```
 
+Every accuracy value on this object — `original_accuracy`,
+`compressed_accuracy`, and everything derived from them
+(`accuracy_retention`, `cqi`'s accuracy factor, every gate's keep/revert
+decision along the way) — is measured against `test_loader`, never
+against `dataloader`.
+
 `analyze()` returns an `AnalysisResult`: `size_mb`, `num_parameters`,
 `architecture_type` (`'cnn'` / `'transformer'` / `'hybrid'` / `'unknown'`),
 `recommended_techniques`, `per_layer_signals` (a `LayerSignal` per eligible
@@ -118,6 +131,12 @@ layer: `name`, `layer_type`, `lrf_epsilon`, `prunable`, `size_kb`), and
 
 Every argument after `model` and `dataloader` is keyword-only. Grouped
 the same way the function itself groups them.
+
+### Evaluation data
+
+| Arg | Default | What it does |
+|---|---|---|
+| `test_loader` | `None` | Genuine held-out set. Every accuracy measurement in `compress()` — baseline, both hyperparameter searches, every technique's gate, the final report — reads from `test_loader`, never from `dataloader`. If omitted, `compress()` auto-splits `dataloader`'s dataset 70/30 (fixed seed, plain random) and reuses that one split for the entire call, printing a warning each time it happens. An extra warning prints if the resulting held-out split comes out under 100 samples. Passing your own is strongly recommended over relying on the auto-split — see the Quickstart note above. |
 
 ### Device
 
@@ -136,13 +155,15 @@ the same way the function itself groups them.
 
 Use these when the model hasn't been trained on your target dataset yet
 (e.g. fresh ImageNet weights with an untrained head, straight out of
-`load_from_registry()` with no existing checkpoint).
+`load_from_registry()` with no existing checkpoint). This step always
+runs before `test_loader` is resolved via auto-split — pretrain trains on
+`dataloader`'s 70% share, never on the held-out portion.
 
 | Arg | Default | What it does |
 |---|---|---|
 | `pretrain_epochs` | `0` | Epochs to fine-tune before compressing. `0` skips this entirely. |
 | `pretrain_lr` | `1e-3` | Learning rate for that pre-training. |
-| `pretrain_test_loader` | `None` | Validation loader for pre-training. Falls back to `dataloader`. |
+| `pretrain_test_loader` | `None` | Validation loader for pre-training. Falls back to `test_loader`. |
 
 ### Hyperparameter search (optional, adds evaluations before the pipeline runs)
 
@@ -154,54 +175,48 @@ Use these when the model hasn't been trained on your target dataset yet
 | `pruning_search_trials` | `16` | Evaluation budget for the pruning search. |
 | `pruning_search_ft_epochs` | `1` | Fine-tune epochs per trial during the pruning search (kept low for speed: the real run uses `pruning_fine_tune_epochs`). |
 | `pruning_search_ft_lr` | `1e-4` | Fine-tune learning rate per trial during the pruning search. |
-| `accuracy_drop_threshold` | `5.0` | Max acceptable accuracy drop in percentage points: used by both searches' final selection AND the pipeline's per-technique revert gate (now Phase A AND Phase B — see "Accuracy-drop gating" below). |
+| `accuracy_drop_threshold` | `5.0` | Max acceptable accuracy drop in percentage points: used by both searches' final selection AND the pipeline's per-technique revert gate. |
 | `early_abort_threshold` | `None` | Direct pp value (not a multiplier on `accuracy_drop_threshold`). After epoch 1 of Pruning's or LRF's own recovery fine-tune — in both the real pipeline and their searches — abort the remaining epochs if the drop vs. the original baseline already exceeds this. `None` (default) = disabled; every fine-tune always runs to completion. |
 | `epsilon_cache_path` | `None` | Override the auto-derived per-model cache file for the epsilon search. `None` = `.sigularty_cache/epsilon_<model>.json`. |
 | `pruning_cache_path` | `None` | Override the auto-derived per-model cache file for the pruning search. `None` = `.sigularty_cache/pruning_<model>.json`. |
 
-**Accuracy-drop gating is always active across BOTH phases (v1.2.2).**
-Structured Pruning, Low-Rank Factorization, and Weight Clustering (Phase A)
-AND GPTQ, standard Quantization, and the final KD recovery fine-tune
-(Phase B) are each measured before/after and reverted to their
-pre-technique state if that ONE technique's own marginal drop exceeds
-`accuracy_drop_threshold`. Each technique gets an independent budget — an
-earlier costly technique does not eat into a later technique's allowance.
-A reverted technique will not appear in `result.techniques_applied` —
-check the console output for a `❌ [TechniqueName] SKIPPED — accuracy
-dropped ...` line if a technique you enabled seems to be missing.
+**Accuracy-drop gating is always active.** Structured Pruning, Low-Rank
+Factorization, Weight Clustering, GPTQ, standard Quantization, and the
+final KD recovery fine-tune are each measured before/after and reverted
+to their pre-technique state if that ONE technique's own marginal drop
+exceeds `accuracy_drop_threshold`. Each technique gets an independent
+budget — an earlier costly technique does not eat into a later
+technique's allowance. A reverted technique will not appear in
+`result.techniques_applied` — check the console output for a `❌
+[TechniqueName] SKIPPED — accuracy dropped ...` line if a technique you
+enabled seems to be missing.
 
 **GPTQ uses a QAT-aware (straight-through estimator) path whenever
-`use_kd_finetune=True`**, so the final KD fine-tune below can actually
-update GPTQ-quantized weights instead of finding them frozen — collapsed
-back to compact storage automatically once KD finishes. If the final KD
-step's cumulative recovery still falls short of `accuracy_drop_threshold`
-after its own gate passes, one bounded, LR-adjusted retry runs
-automatically before the result is accepted as-is. (Earlier versions of
-`compress()` left Phase B completely ungated and ran KD *before* Phase B —
-meaning quantization/GPTQ damage had no gate to catch it and no recovery
-pass to fix it, even though this file's own KD docs already described KD
-as running "after quantization/GPTQ." Both are fixed now: KD always runs
-*after* Phase B, matching that description, which was previously
-aspirational for `compress()` specifically. One deliberate divergence from
-`run_compression_pipeline()`'s CLI path remains: fp16 is *not* skipped
-here when GPTQ is absent or reverted — fp16-only stays a fully independent,
-always-available configuration for `compress()`.)
+`use_kd_finetune=True`**, so the final KD fine-tune can actually update
+GPTQ-quantized weights instead of finding them frozen — collapsed back to
+compact storage automatically once KD finishes. If the final KD step's
+cumulative recovery still falls short of `accuracy_drop_threshold` after
+its own gate passes, one bounded, LR-adjusted retry runs automatically
+before the result is accepted as-is. KD always runs after GPTQ and
+standard quantization, never before, so it recovers accuracy lost to
+every prior step at once, including quantization/GPTQ's own damage. fp16
+is not skipped when GPTQ is absent or reverted — fp16-only stays a fully
+independent, always-available configuration.
 
-**Search result caching (fixed — was previously a silent correctness
-bug).** Each search caches trial results to disk purely by hyperparameter
-value, with no reference to which model produced them. Earlier versions of
-`compress()` always used the same two hardcoded filenames
-(`epsilon_cache.json`, `pruning_search_cache.json`) for every call — so
-compressing two different models from the same working directory could
-silently reuse one model's cached trial results for the other, producing
-search output that looked plausible but was measuring the wrong model
-entirely. `epsilon_cache_path`/`pruning_cache_path` now default to a
-filename derived from the model's class name + parameter count +
-`num_classes`, so different models get separate cache files automatically.
-Pass an explicit path yourself for a stronger guarantee (e.g. distinct
-caches per dataset too, not just per model/class-count). If you have
-`epsilon_cache.json` / `pruning_search_cache.json` left over from an older
-version in your working directory, they're now orphaned — safe to delete.
+**Search result caching.** Each search caches trial results to disk
+purely by hyperparameter value, with no reference to which model produced
+them. `epsilon_cache_path`/`pruning_cache_path` default to a filename
+derived from the model's class name + parameter count + `num_classes`, so
+different models get separate cache files automatically. Pass an
+explicit path yourself for a stronger guarantee (e.g. distinct caches per
+dataset too, not just per model/class-count).
+
+If you have `.sigularty_cache/` files from before `test_loader` existed,
+delete them. Those cached accuracy numbers were measured against
+`dataloader` (effectively training data, since `compress()` had no other
+option at the time) rather than a genuine held-out set — reusing them now
+would silently mix pre-fix and post-fix numbers under the same cache
+keys, and the cached values would understate real accuracy drop.
 
 ### Technique enable flags
 
@@ -229,19 +244,10 @@ version in your working directory, they're now orphaned — safe to delete.
 | `pruning_isomorphic` | `False` | Force identical pruning structure across coupled dependency groups. |
 | `pruning_round_to` | `None` | Round pruned channel counts to a multiple of this (e.g. `8`/`16` for Tensor Core alignment). |
 
-**Note:** `find_optimal_pruning=True` now correctly forwards
-`pruning_max_ratio` (and `pruning_residual_max_ratio`) into the search
-itself, and correctly reads the search's winning max-ratio back out
-afterward. In earlier versions, the pruning search always ran uncapped
-regardless of `pruning_max_ratio`, and even when the search picked a safe
-config, its chosen max-ratio was silently discarded on the way back into
-the real pipeline — the pipeline always fell back to whatever
-`pruning_max_ratio` default was in effect (`0.95` unless you changed it).
-Combined with gating being off (see above), this could let pruning
-collapse the residual-critical layers at every stage boundary with nothing
-to catch or revert it. Both are fixed now; if you were relying on
-`find_optimal_pruning` before this fix, re-run — the pruning config it
-actually applies may now be meaningfully different (and safer).
+**Note:** `find_optimal_pruning=True` forwards `pruning_max_ratio` (and
+`pruning_residual_max_ratio`) into the search itself, and reads the
+search's winning max-ratio back out afterward — the config the search
+recommends is the config the real pipeline actually applies.
 
 ### Low-Rank Factorization (LRF) hyperparameters
 
@@ -264,13 +270,12 @@ actually applies may now be meaningfully different (and safer).
 
 ### Knowledge distillation fine-tuning hyperparameters
 
-The final recovery step. As of v1.2.2 this is genuinely true rather than
-aspirational: KD now always runs after quantization/GPTQ (Phase B), never
-inside Phase A, so it recovers accuracy lost from every prior step at
-once — including quantization/GPTQ's own damage, now that Phase B is
-gated too (see "Accuracy-drop gating" above). If GPTQ is enabled, it uses
-a QAT-aware path specifically so this step can update GPTQ-quantized
-weights rather than finding them frozen.
+The final recovery step. KD always runs after quantization/GPTQ, never
+before, so it recovers accuracy lost from every prior step at once —
+including quantization/GPTQ's own damage, since those are gated too (see
+"Accuracy-drop gating" above). If GPTQ is enabled, it uses a QAT-aware
+path specifically so this step can update GPTQ-quantized weights rather
+than finding them frozen.
 
 | Arg | Default | What it does |
 |---|---|---|
@@ -278,7 +283,7 @@ weights rather than finding them frozen.
 | `kd_lr` | `1e-5` | Learning rate. |
 | `kd_temperature` | `4.0` | Softmax temperature for the teacher's soft labels. |
 | `kd_alpha` | `0.7` | Weight on hard-label loss; `1 - kd_alpha` goes to the distillation loss. |
-| `kd_max_batches` | `50` | Max batches per KD epoch, matching `main.py`'s CLI default. Use `0` for the full dataloader each epoch. Previously not exposed — the old in-pipeline KD path silently inherited a different function's default of the same value. |
+| `kd_max_batches` | `50` | Max batches per KD epoch. Use `0` for the full dataloader each epoch. |
 
 ### Quantization hyperparameters
 
