@@ -75,7 +75,7 @@ class CompressionResult:
                         Both accuracy values are measured on test_loader —
                         a genuine held-out set — never on the data the model
                         is fine-tuned on.
-    size_original_mb    Original model size in MB.
+    size_original_mb    Original model size in MB (parameters + buffers).
     size_compressed_mb  Compressed model size in MB.
     original_accuracy   Original model top-1 accuracy % on test_loader.
     compressed_accuracy Compressed model top-1 accuracy % on test_loader.
@@ -430,6 +430,13 @@ def compress(
     Accuracy-Drop Threshold & Per-Technique Gating" in README.md for the
     full mechanism.
 
+    If find_optimal_epsilon / find_optimal_pruning is enabled and the search
+    finds no viable configuration for that technique (CQI below the
+    viability floor, or every candidate still over accuracy_drop_threshold
+    even at the relaxed tier), that technique is disabled for this run —
+    use_lrf / use_pruning is forced to False — rather than falling through
+    to lrf_epsilon's / pruning_ratio's default value.
+
     The KD fine-tune (use_kd_finetune) runs after GPTQ and standard
     quantization, never before, so it recovers accuracy lost to every prior
     step at once.
@@ -553,6 +560,9 @@ def compress(
         if best_eps is not None:
             print(f"  → Optimal ε = {best_eps:.4f}")
             lrf_epsilon = best_eps
+        else:
+            print("  ❌  LRF search: score<1.0 or drop>threshold. Disabling LRF.")
+            use_lrf = False
 
     # ── Optional: pruning search ──────────────────────────────────────────────
     if find_optimal_pruning and use_pruning:
@@ -593,6 +603,9 @@ def compress(
             print(f"  → ratio={pruning_ratio:.3f}  "
                   f"max_ratio={pruning_max_ratio:.2f}  "
                   f"steps={pruning_iterative_steps}")
+        else:
+            print("  ❌  Pruning search: no viable config. Disabling pruning.")
+            use_pruning = False
 
     # ── Structural compression (float32) ───────────────────────────────────────
     # BN Fusion, Pruning, LRF, Clustering. Quantization is deferred:
@@ -712,10 +725,27 @@ def compress(
         _gptq_report_data = getattr(_gptq_result, '_gptq_report', {}) or {}
         _gptq_n_quantized  = _gptq_report_data.get('layers_quantized', 0)
         _gptq_n_eligible   = _gptq_report_data.get('total_eligible_layers', 0)
+        _gptq_is_qat       = _gptq_report_data.get('qat', False)
         _gptq_post_acc = (
             current_accuracy if _gptq_kept
             else measure_accuracy(_gptq_result, test_loader, device)
         )
+        _gptq_structural_summary = (
+            f"{_gptq_n_quantized}/{_gptq_n_eligible} eligible Linear "
+            f"layer(s) quantized to INT{gptq_bits}"
+        )
+        if _gptq_is_qat:
+            # In QAT mode every quantized layer carries a full float32
+            # shadow_weight (see _Int4LinearQAT), so the model is genuinely
+            # larger right after this step than it was before GPTQ ran —
+            # this is not the final storage form. Without this note, the
+            # Size line below (a "ratio" under 1.0, i.e. the model growing)
+            # reads exactly like a compression bug.
+            _gptq_structural_summary += (
+                " — size shown includes trainable float32 shadow weights "
+                "for the KD fine-tune that follows; collapses to compact "
+                f"INT{gptq_bits} storage once that step finishes"
+            )
         report_technique_impact(
             f"GPTQ INT{gptq_bits}",
             pre_model=_pre_gptq_model, post_model=_gptq_result,
@@ -725,10 +755,7 @@ def compress(
             original_accuracy=baseline_acc, original_size_mb=baseline_size,
             original_latency_ms=baseline_latency,
             input_shape=input_shape, input_dtype=input_dtype,
-            structural_summary=(
-                f"{_gptq_n_quantized}/{_gptq_n_eligible} eligible Linear "
-                f"layer(s) quantized to INT{gptq_bits}"
-            ),
+            structural_summary=_gptq_structural_summary,
             structural_zero=(_gptq_n_quantized == 0),
         )
         if not _gptq_kept:

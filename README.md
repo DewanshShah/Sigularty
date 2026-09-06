@@ -1621,6 +1621,20 @@ ordinary (non-QAT) GPTQ - same compact packed storage, just with weights that
 have now actually been adjusted by the recovery fine-tune. Safe to call
 unconditionally (a no-op scan when QAT was never used).
 
+**In the per-technique Impact report:** while QAT mode is active, GPTQ's
+model is genuinely *larger* than it was immediately before GPTQ ran - the
+shadow weights above are real, dense float32 parameters, not yet collapsed.
+Read in isolation, the `[Impact]` block's Size line for this step (e.g.
+`112.741 MB → 327.521 MB`, a `0.34×` "ratio") looks exactly like a
+compression bug. It isn't: it's the same `shadow_weight` this section
+describes. To make that legible in the moment rather than requiring a reader
+to already know this mechanism, the structural summary line says so
+explicitly whenever `._gptq_report['qat']` is `True` - e.g. `37/37 eligible
+Linear layer(s) quantized to INT4 — size shown includes trainable float32
+shadow weights for the KD fine-tune that follows; collapses to compact INT4
+storage once that step finishes`. The size shrinks back down to the expected
+compact form as soon as `collapse_qat_layers()` runs.
+
 **A known, accepted precision interaction:** when `QUANT_MODE='fp16'` runs
 after GPTQ (the common GPTQ+fp16 combination), it casts the whole model -
 including `_Int4LinearQAT`'s `shadow_weight` - to float16 before the KD step
@@ -2035,7 +2049,7 @@ the registry's `recommended` dict and cannot be overridden by it.
 
 ### `apply_bn_fusion(model)`
 Fuses all Conv→BN and Linear→BN pairs. Zero accuracy cost. Returns new model.
-Never gated.
+Never gated. This only works assuming bn_layer already exist.
 
 ### `apply_structured_pruning(model, dataloader, device, pruning_ratio, model_type, ..., max_pruning_ratio, residual_max_ratio=None, kd_temperature, kd_alpha, capture_pre_finetune_accuracy=False)`
 Full structured pruning pipeline. Recovery fine-tune always uses

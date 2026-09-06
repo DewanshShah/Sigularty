@@ -2332,7 +2332,8 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
       later technique's allowance.  Pruning/LRF/Clustering are gated inside
       apply_compression_pipeline (compression.py); GPTQ/Quantization/the
       final KD step are gated here, since they run outside that function
-      (the two-phase float32-then-quantize design described in README.md).
+      entirely (dynamic INT8 has no CUDA kernel, so quantization is applied
+      after the float32 structural stages so latency comparisons stay fair).
 
       A technique that gets reverted is NOT listed in the final report's
       "techniques used" — the report only ever describes what the returned
@@ -2537,24 +2538,20 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
             residual_max_ratio=getattr(args, 'pruning_residual_max_ratio', None),
             round_to=getattr(args, 'pruning_round_to', None),
             isomorphic=getattr(args, 'pruning_isomorphic', False),
-            # BUGFIX: previously always defaulted to the vision shape
-            # (1,3,224,224) with no dtype override, since neither was passed
-            # here. For NLP registry models (input_ids as int64 token IDs of
-            # shape (1,128)) that silently crashed the baseline latency
-            # measurement inside a 4D-vs-2D shape mismatch deep in the HF
-            # forward pass — caught by a bare except and swallowed as
-            # "latency measurement failed, falling back to 1.0ms". Passing
-            # the real registry-derived shape/dtype (set earlier in this
-            # function from model_registry metadata) fixes that for good.
+            # For NLP registry models (input_ids as int64 token IDs of shape
+            # (1,128)), the baseline latency measurement needs the real
+            # registry-derived shape/dtype (set earlier in this function
+            # from model_registry metadata) rather than the vision-only
+            # (1,3,224,224) default — otherwise it crashes deep in the HF
+            # forward pass on a 4D-vs-2D shape mismatch, caught by a bare
+            # except and silently reported as "latency measurement failed,
+            # falling back to 1.0ms".
             input_shape=getattr(args, 'input_shape', (1, 3, 224, 224)),
             input_dtype=getattr(args, 'input_dtype', None),
             search_ft_epochs=getattr(args, 'pruning_search_ft_epochs', 1),
             search_ft_lr=getattr(args, 'pruning_search_ft_lr', 1e-4),
-            # BUGFIX: this call previously omitted accuracy_drop_threshold
-            # entirely, silently falling back to the function's own default
-            # of 5.0pp instead of your configured global threshold.
             accuracy_drop_threshold=_threshold,
-            # NEW: wires FINE_TUNE_ABORT_THRESHOLD through to every per-trial
+            # Wires FINE_TUNE_ABORT_THRESHOLD through to every per-trial
             # recovery fine-tune this search runs (see _kd_recovery_fine_tune
             # in compression.py for the actual abort check).
             early_abort_threshold=getattr(args, 'fine_tune_abort_threshold', 30.0),
@@ -2592,24 +2589,23 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
             skip_large_kernels=getattr(args, 'lrf_skip_large_kernels', False),
             cache_path='epsilon_cache.json',
             num_trials=getattr(args, 'epsilon_search_num_trials', 15),
-            # Same fix as the pruning search above — real registry shape/dtype
+            # Same real registry shape/dtype as the pruning search above,
             # instead of the vision-only (1,3,224,224) default.
             input_shape=getattr(args, 'input_shape', (1, 3, 224, 224)),
             input_dtype=getattr(args, 'input_dtype', None),
             # dataloader/num_classes are what actually let EPSILON_SEARCH_FT_EPOCHS
             # do anything — apply_low_rank_factorization only fine-tunes when
-            # all three of dataloader/device/num_classes are supplied. Without
-            # this, search_ft_epochs>0 in main.py was silently a no-op here.
+            # all three of dataloader/device/num_classes are supplied.
             dataloader=train_loader,
             num_classes=getattr(args, 'num_classes', 102),
             search_ft_epochs=getattr(args, 'epsilon_search_ft_epochs', 0),
             search_ft_lr=getattr(args, 'epsilon_search_ft_lr', 0.0001),
             accuracy_drop_threshold=_threshold,
-            # NEW: same early-abort wiring as the pruning search. Note this
-            # can't help much here specifically since EPSILON_SEARCH_FT_EPOCHS
-            # is 1 by default — there's no "remaining epochs" to skip after
-            # the only epoch finishes. It's here for consistency and for
-            # anyone who raises EPSILON_SEARCH_FT_EPOCHS later.
+            # Same early-abort wiring as the pruning search. Note this can't
+            # help much here specifically since EPSILON_SEARCH_FT_EPOCHS is 1
+            # by default — there's no "remaining epochs" to skip after the
+            # only epoch finishes. It's here for consistency and for anyone
+            # who raises EPSILON_SEARCH_FT_EPOCHS later.
             early_abort_threshold=getattr(args, 'fine_tune_abort_threshold', 30.0),
             **{k: v for k, v in _cqi_w.items() if k != 'w_kl'},  # no KL for LRF
         )
@@ -2634,19 +2630,16 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
         print("      Auto-switching to dynamic INT8.\n")
         args.quant_mode = 'dynamic'
 
-    # ── 5. Compression pipeline — two phases ─────────────────────────────────
+    # ── 5. Compression pipeline ──────────────────────────────────────────────
     #
-    # WHY TWO PHASES?
+    # WHY THE STRUCTURAL STAGES AND QUANTIZATION ARE MEASURED SEPARATELY:
     #   dynamic INT8 (qint8) has no CUDA kernel — it runs on CPU only.
     #   Measuring original model on GPU (7 ms) and compressed on CPU (113 ms)
-    #   is a meaningless comparison.
-    #
-    #   Phase A: BN Fusion + Pruning + LRF + Clustering → float32 → stays on
-    #            GPU → latency here.  Per-technique accuracy gating is active
-    #            throughout this phase (test_loader + _threshold passed in).
-    #   Phase B: GPTQ → Quantization (fp16 or INT8) → final KD recovery, all
-    #            gated individually here in run_compression_pipeline since
-    #            they run outside apply_compression_pipeline.
+    #   is a meaningless comparison. BN Fusion, Pruning, LRF, and Clustering
+    #   all stay in float32 on GPU, so latency is measured there. GPTQ and
+    #   standard Quantization run afterward and are gated individually here
+    #   in run_compression_pipeline, since they operate outside
+    #   apply_compression_pipeline and change precision/device.
     #
     #   fp16 stays on GPU (Tensor Cores), dynamic INT8 moves to CPU.
     # ─────────────────────────────────────────────────────────────────────────
@@ -2654,10 +2647,10 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
     print("STEP 3: STRUCTURAL COMPRESSION  (BN Fusion · Pruning · LRF · Clustering)")
     print("=" * 70)
 
-    # Phase A: All structural compression — float32, GPU-capable, individually
-    # gated (Pruning / LRF / Clustering each revert on their own marginal
-    # accuracy drop, independent budgets).  Quantization is deferred to
-    # Phase B so latency can be measured in float32.
+    # All structural compression — float32, GPU-capable, individually gated
+    # (Pruning / LRF / Clustering each revert on their own marginal accuracy
+    # drop, independent budgets). Quantization is deferred below so latency
+    # can be measured in float32 first.
     compressed_pre_quant = apply_compression_pipeline(
         model=model,
         dataloader=train_loader,
@@ -2711,12 +2704,12 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
         kd_num_classes=getattr(args, 'num_classes', 102),
         # ── Quantization deferred ────────────────────────────────────────────
         use_quantization=False,
-        # ── Tier 3B: GPTQ (also deferred — runs in Phase B) ─────────────────
+        # ── Tier 3B: GPTQ (also deferred — runs later) ──────────────────────
         use_gptq=False,
         # ── Per-technique accuracy gating ────────────────────────────────────
         test_loader=test_loader,
         accuracy_drop_threshold=_threshold,
-        # NEW: same early-abort protection as the searches, now applied to
+        # Same early-abort protection as the searches, now applied to
         # Pruning's and LRF's ACTUAL recovery fine-tunes in the real pipeline
         # (not just their hyperparameter searches) — matches what main.py's
         # own docs for FINE_TUNE_ABORT_THRESHOLD always said this should cover.
@@ -2725,7 +2718,7 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
         # Absolute-original baseline numbers, measured once above — passed
         # through so every impact report inside apply_compression_pipeline
         # computes "cumulative vs. original" against the same reference the
-        # rest of this function (Phase B below) uses.
+        # rest of this function uses further below.
         original_size_mb=orig_size_mb,
         original_latency_ms=orig_latency_ms,
         input_shape=_impact_input_shape,
@@ -2785,7 +2778,7 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
             save_path=_pruning_report_path,
         )
 
-    # Phase B: GPTQ → Quantization → final KD recovery.
+    # GPTQ → Quantization → final KD recovery.
     #
     # ORDER: GPTQ runs FIRST, standard quantization SECOND.
     # If dynamic INT8 runs before GPTQ, it replaces every nn.Linear with
@@ -2827,15 +2820,14 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
             bits=_gptq_bits,
             num_calibration_batches=getattr(args, 'gptq_cal_batches', 16),
             block_size=getattr(args, 'gptq_block_size', 128),
-            # NEW: only ask for trainable (QAT/STE) GPTQ layers when a KD
-            # fine-tune is actually going to run afterward (Step 5B below) —
-            # that's the only thing that would ever use shadow_weight's
-            # trainability. Otherwise this is exactly the old frozen
-            # _Int4Linear, zero added memory overhead. See _Int4LinearQAT's
-            # docstring for why this matters: without it, the final KD step
-            # (whose whole documented job is recovering accuracy lost to
-            # every prior step, explicitly including quantization) could
-            # never actually touch a single GPTQ-quantized weight.
+            # Only requests trainable (QAT/STE) GPTQ layers when a KD
+            # fine-tune is actually going to run afterward — that is the
+            # only thing that would ever use shadow_weight's trainability.
+            # Otherwise this produces the frozen _Int4Linear, with zero
+            # added memory overhead. See _Int4LinearQAT's docstring: without
+            # this, the final KD step — whose job is recovering accuracy
+            # lost to every prior step, explicitly including quantization —
+            # could never actually touch a single GPTQ-quantized weight.
             qat=getattr(args, 'use_kd_finetune', False),
         )
         compressed_model, current_accuracy, _gptq_kept = gate_technique_accuracy(
@@ -2853,10 +2845,27 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
         _gptq_report_data = getattr(_gptq_result, '_gptq_report', {}) or {}
         _gptq_n_quantized  = _gptq_report_data.get('layers_quantized', 0)
         _gptq_n_eligible   = _gptq_report_data.get('total_eligible_layers', 0)
+        _gptq_is_qat       = _gptq_report_data.get('qat', False)
         _gptq_post_acc = (
             current_accuracy if _gptq_kept
             else measure_accuracy(_gptq_result, test_loader, args.device)
         )
+        _gptq_structural_summary = (
+            f"{_gptq_n_quantized}/{_gptq_n_eligible} eligible Linear "
+            f"layer(s) quantized to INT{_gptq_bits}"
+        )
+        if _gptq_is_qat:
+            # In QAT mode every quantized layer carries a full float32
+            # shadow_weight (see _Int4LinearQAT), so the model is genuinely
+            # larger right after this step than it was before GPTQ ran —
+            # this is not the final storage form. Without this note, the
+            # Size line below (a "ratio" under 1.0, i.e. the model growing)
+            # reads exactly like a compression bug.
+            _gptq_structural_summary += (
+                " — size shown includes trainable float32 shadow weights "
+                "for the KD fine-tune that follows; collapses to compact "
+                f"INT{_gptq_bits} storage once that step finishes"
+            )
         report_technique_impact(
             f"GPTQ INT{_gptq_bits}",
             pre_model=_pre_gptq_model, post_model=_gptq_result,
@@ -2866,10 +2875,7 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
             original_accuracy=orig_accuracy, original_size_mb=orig_size_mb,
             original_latency_ms=orig_latency_ms,
             input_shape=_impact_input_shape, input_dtype=_impact_input_dtype,
-            structural_summary=(
-                f"{_gptq_n_quantized}/{_gptq_n_eligible} eligible Linear "
-                f"layer(s) quantized to INT{_gptq_bits}"
-            ),
+            structural_summary=_gptq_structural_summary,
             structural_zero=(_gptq_n_quantized == 0),
         )
         if not _gptq_kept:
@@ -3297,9 +3303,8 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
 # All training loops, evaluation helpers, and model traversal utilities live here.
 #
 # NOTE: this file's fine_tune_with_distillation is a DUPLICATE of the one in
-# compression.py (pre-existing duplication, not introduced by these changes).
-# Both copies have been updated identically: per-epoch training accuracy is
-# now ALWAYS tracked (not just when test_loader is given), the epoch-1-
+# compression.py (pre-existing duplication). Both copies track per-epoch
+# training accuracy ALWAYS (not just when test_loader is given), the epoch-1-
 # exactly-0.0% safety check uses that training accuracy, and the returned
 # model gets `._kd_history` attached for callers that need the full
 # per-epoch trend (e.g. run_compression_pipeline's 6d recovery-quality
