@@ -1,4 +1,4 @@
-# Model Compression Toolkit - Complete Reference
+# Sigularty - Complete Reference
 
 sigularty is a PyTorch model compression toolkit. It takes any PyTorch model,
 runs it through a configurable pipeline of compression techniques, and produces
