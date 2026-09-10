@@ -16,7 +16,7 @@ Here are compression results on some models (The result is achieved by the algor
 
 | Model | Acc Drop | Ratio | CQI | Size (MB) | Params (M) | Accuracy (%) | Latency (ms) | Constants |
 | :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- |
-| `vit_b_16` | **0.00%** | **4.51×** | **4.526** | 327.59→72.67 | 85.9→21.5 | 77.00→77.00 | 14.96→14.90 | `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001` |
+| `vit_b_16` | **0.00%** | **4.51×** | **4.526** | 327.59→72.67 | 85.9→21.5 | 77.00→77.00 | 14.96→14.90 | `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001, accuracy_drop_threshold = 10` |
 
 ---
 
