@@ -12,6 +12,12 @@ compression theory behind every decision from scratch.
 
 For installation and learning the "sigularty" package refer to it's [Pypi page](https://pypi.org/project/sigularty/)
 
+Here are compression results on some models (The result is achieved by the algorithm itself, no human fine-tuning was involved): 
+
+| Model | Acc Drop | Ratio | CQI | Size (MB) | Params (M) | Accuracy (%) | Latency (ms) | Constants |
+| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- |
+| `vit_b_16` | **0.00%** | **4.51×** | **4.526** | 327.59→72.67 | 85.9→21.5 | 77.00→77.00 | 14.96→14.90 | `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001` |
+
 ---
 
 ## File Map
