@@ -14,9 +14,13 @@ For installation and learning the "sigularty" package refer to it's [Pypi page](
 
 Here are compression results on some models (The result is achieved by the algorithm itself, no human fine-tuning was involved): 
 
-| Model | Acc Drop | Ratio | CQI | Size (MB) | Params (M) | Accuracy (%) | Latency (ms) | Constants |
-| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: | :--- |
-| `vit_b_16` | **0.00%** | **4.51×** | **4.526** | 327.59→72.67 | 85.9→21.5 | 77.00→77.00 | 14.96→14.90 | `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001, accuracy_drop_threshold = 10` |
+Constants used for each one (Better results can be achieved by using a better learning rate): `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001, accuracy_drop_threshold = 10`
+
+| Model | Acc Drop | Compression Ratio | CQI | Speedup | Size (MB) | Accuracy (%) | Latency (ms) |
+| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: |
+| `vit_b_16` | **0.00%** | **4.51×** | **4.526**| **1.00x** | 327.59→72.67 | 77.00→77.00 | 14.96→14.90 |
+| `efficientnet_b0` | **2.80%** | **2.61x** | **2.284**| **0.90x** | 15.95 -> 6.11 | 91.80 -> 89.00 | 8.238 -> 9.124|
+| `bert_base` | **8.60%** | **5.47x** | **3.67** | **0.74x** | 417.66 -> 76.37 | 90.60 -> 82.00 | 10.309 -> 13.873 |
 
 ---
 
