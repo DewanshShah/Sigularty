@@ -12,7 +12,7 @@ compression theory behind every decision from scratch.
 
 For installation and learning the "sigularty" package refer to it's [Pypi page](https://pypi.org/project/sigularty/)
 
-Here are compression results on some models (The result is achieved by the algorithm itself, no human fine-tuning was involved): 
+Here are compression results on some models (The results are achieved by the algorithm itself, no human fine-tuning was involved): 
 
 Constants used for each one (Better results can be achieved by using a better learning rate): `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001, accuracy_drop_threshold = 10`
 
