@@ -333,7 +333,7 @@ def _accuracy_barrier_factor(
     return (2.0 - penalty_slope) - math.exp(penalty_steepness * (x - 1.0))
 
 
-def CQI(
+def compression_quality_index(
     accuracy: float,
     size_mb: float,
     baseline_accuracy: float,
