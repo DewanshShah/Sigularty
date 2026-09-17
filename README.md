@@ -1,4 +1,4 @@
-# Model Compression Toolkit - Complete Reference
+# Sigularty - Complete Reference
 
 sigularty is a PyTorch model compression toolkit. It takes any PyTorch model,
 runs it through a configurable pipeline of compression techniques, and produces
@@ -11,6 +11,17 @@ in this file. It assumes familiarity with PyTorch basics but explains the
 compression theory behind every decision from scratch.
 
 For installation and learning the "sigularty" package refer to it's [Pypi page](https://pypi.org/project/sigularty/)
+
+Here are compression results on some models (The results are achieved by the algorithm itself, no human fine-tuning was involved): 
+
+Constants used for each one (Better results can be achieved by using a better learning rate): `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001, accuracy_drop_threshold = 10`
+
+| Model | Acc Drop | Compression Ratio | CQI | Speedup | Size (MB) | Accuracy (%) | Latency (ms) |
+| :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: |
+| `Resnet50` | **2.20%** | **8.00x** | **9.897** | **1.28x** | 90.66 -> 11.34 | 66.60 -> 64.40 | 6.977 -> 5.451 |
+| `vit_b_16` | **0.00%** | **4.51×** | **4.526**| **1.00x** | 327.59 -> 72.67 | 77.00 -> 77.00 | 14.96 -> 14.90 |
+| `efficientnet_b0` | **2.80%** | **2.61x** | **2.284**| **0.90x** | 15.95 -> 6.11 | 91.80 -> 89.00 | 8.238 -> 9.124|
+| `bert_base` | **8.60%** | **5.47x** | **3.67** | **0.74x** | 417.66 -> 76.37 | 90.60 -> 82.00 | 10.309 -> 13.873 |
 
 ---
 
