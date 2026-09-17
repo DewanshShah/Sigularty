@@ -1472,7 +1472,7 @@ def _setup_cifar10_data(
 
     print(f"\n📦 Loading CIFAR-10  (native {input_size}×{input_size}, no resize)...")
     train_ds = datasets.CIFAR10(root="data", train=True,  download=True, transform=transform_train)
-    test_ds  = datasets.CIFAR10(root="data", train=False, download=True, transform=transform_test)
+    test_ds = datasets.CIFAR10(root="data", train=False, download=True, transform=transform_test)
 
     if train_sample is not None and train_sample > 0:
         train_ds = Subset(train_ds, list(range(min(train_sample, len(train_ds)))))
@@ -3284,6 +3284,7 @@ def run_compression_pipeline(args: argparse.Namespace) -> dict:
         input_shape=INPUT_SHAPE,
         latency_iterations=100,
         latency_warmup=10,
+        accuracy_drop_threshold=_threshold,
     )
 
     print("\n✅ Done. Report saved to:", args.report_path)

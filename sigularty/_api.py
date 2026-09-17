@@ -450,6 +450,19 @@ def compress(
     share (and corrupt) each other's cached numbers. Pass an explicit path
     yourself if you need a stronger guarantee (e.g. distinct caches per
     dataset too, not just per model/num_classes).
+
+    CQI accuracy factor (all cqi_w_* args and the final result.cqi): every
+    compression_quality_index() call this function makes — the compressed
+    model's final CQI, and every trial score inside the two searches — now
+    passes accuracy_drop_threshold straight through, which is what opts them
+    into the new three-piece barrier accuracy factor (see
+    optimization.py's compression_quality_index docstring) instead of the
+    legacy (accuracy/baseline_accuracy)**cqi_w_accuracy ratio. This is the
+    fix for the original defect that motivated the barrier factor: an
+    unbounded size/latency ratio can no longer buy back an accuracy drop
+    that is at or past accuracy_drop_threshold — the accuracy factor falls
+    away unboundedly on its own once a config reaches that point, whatever
+    the compression ratio.
     """
     # ── Deferred imports ────────────────────────────────
     from sigularty.compression import (
@@ -1026,6 +1039,10 @@ def compress(
         techniques.append(f'KD Fine-tune (T={kd_temperature:.1f}, α={kd_alpha:.2f})')
 
     # ── CQI ───────────────────────────────────────────────────────────────────
+    # accuracy_drop_threshold is passed straight through here too — this is
+    # what makes the FINAL, headline CQI displayed on CompressionResult use
+    # the new barrier accuracy factor rather than the legacy ratio, exactly
+    # like every trial score inside the two searches above already does.
     cqi = compression_quality_index(
         accuracy=comp_acc,
         size_mb=comp_size,
@@ -1033,6 +1050,7 @@ def compress(
         baseline_size=baseline_size,
         latency_ms=comp_latency,
         baseline_latency_ms=baseline_latency,
+        accuracy_drop_threshold=accuracy_drop_threshold,
         w_accuracy=cqi_w_accuracy,
         w_size=cqi_w_size,
         w_latency=cqi_w_latency,
@@ -1062,6 +1080,7 @@ def compress(
                 save_path=report_path,
                 dataloader=test_loader,
                 device=acc_device,
+                accuracy_drop_threshold=accuracy_drop_threshold,
             )
             out_report_path = os.path.abspath(report_path)
         except Exception as exc:
@@ -1583,6 +1602,7 @@ def plot_compression_report(
     *,
     save_path:          str           = 'compression_report.png',
     device:             Optional[str] = None,
+    accuracy_drop_threshold: Optional[float] = None,
     show_in_notebook:   bool          = True,
 ) -> str:
     """
@@ -1604,6 +1624,17 @@ def plot_compression_report(
                       any fallback measurements to stay consistent with it.
     save_path       : Output PNG path. Default 'compression_report.png'.
     device          : Device for metric fallback computation. Auto-detected.
+    accuracy_drop_threshold: The accuracy_drop_threshold you passed to
+                      compress() for this result, if you want the CQI shown
+                      here (should it need recomputing) to use the new
+                      barrier accuracy factor rather than the legacy ratio.
+                      Not required — result.cqi is already attached to
+                      metrics_dict below and generate_compression_report()
+                      only falls back to recomputing CQI when it's missing,
+                      so this only matters if you're calling this function
+                      standalone against metrics you built yourself without
+                      a 'cqi' key already set. None (default) = legacy
+                      behaviour if a recompute is ever needed.
     show_in_notebook: If True and running in Jupyter/Colab, displays the image
                       inline after saving.
 
@@ -1643,6 +1674,7 @@ def plot_compression_report(
         save_path=save_path,
         dataloader=dataloader,
         device=device,
+        accuracy_drop_threshold=accuracy_drop_threshold,
     )
 
     abs_path = os.path.abspath(save_path)

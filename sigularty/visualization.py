@@ -1091,6 +1091,7 @@ def generate_compression_report(
     input_shape: tuple = (1, 3, 224, 224),
     latency_iterations: int = 100,
     latency_warmup: int = 10,
+    accuracy_drop_threshold: Optional[float] = None,
 ) -> dict:
     """
     Generate and save a comprehensive compression analysis report.
@@ -1134,6 +1135,26 @@ def generate_compression_report(
         input_shape:        Dummy input shape for latency measurement.
         latency_iterations: Forward passes used for latency timing.
         latency_warmup:     Untimed warmup passes before timing starts.
+        accuracy_drop_threshold: The technique's own accuracy-drop budget (pp),
+                            same value as ACCURACY_DROP_THRESHOLD /
+                            accuracy_drop_threshold used everywhere else in
+                            this toolkit. Only consulted when metrics_dict
+                            doesn't already carry a 'cqi' value — in that
+                            case it's passed straight through to
+                            compression_quality_index() as its own
+                            accuracy_drop_threshold, which is what actually
+                            opts this fallback computation into the new
+                            barrier accuracy factor (see optimization.py's
+                            compression_quality_index docstring) instead of
+                            the legacy w_accuracy-exponent ratio. None
+                            (default) = legacy behaviour, unchanged. This is
+                            the ONLY CQI computation path the plain
+                            `python main.py` CLI flow ever exercises (see
+                            run_compression_pipeline in helper_functions.py,
+                            which never sets metrics['cqi'] itself), so
+                            leaving this None there would silently keep the
+                            CLI on the old formula even after everywhere
+                            else has moved to the new one.
 
     Returns:
         Final metrics dict enriched with all computed values.
@@ -1175,6 +1196,7 @@ def generate_compression_report(
                 comp_acc or 0.0, comp_size or (orig_size or 1.0),
                 orig_acc or 1.0, orig_size or 1.0,
                 comp_lat, orig_lat,
+                accuracy_drop_threshold=accuracy_drop_threshold,
             ) if orig_acc else None
         except Exception:
             try:
@@ -1183,6 +1205,7 @@ def generate_compression_report(
                     comp_acc or 0.0, comp_size or (orig_size or 1.0),
                     orig_acc or 1.0, orig_size or 1.0,
                     comp_lat, orig_lat,
+                    accuracy_drop_threshold=accuracy_drop_threshold,
                 ) if orig_acc else None
             except Exception:
                 cqi_val = None

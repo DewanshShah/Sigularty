@@ -1,5 +1,5 @@
 """
-compression.py
+Compression.py
 ====================
 Seven model compression and optimisation techniques for PyTorch models.
 
@@ -7,7 +7,7 @@ Techniques (in pipeline order)
 --------------------------------
   BN Fusion          — fold BatchNorm into preceding Conv/Linear (zero accuracy cost)
   Sensitivity Anal.  — per-layer importance scoring to guide pruning ratios
-  Structured Pruning — activation-statistics filter removal via Torch-Pruning
+  Structured Pruning — activation-statistics filter removal via Torch-Pruningx
   Adaptive LRF       — per-layer SVD factorization with analytically computed epsilons
   Weight Clustering  — k-means quantisation of weight tensors
   KD Fine-tuning     — knowledge distillation from original model for accuracy recovery
