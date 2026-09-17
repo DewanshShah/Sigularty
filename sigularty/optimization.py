@@ -446,7 +446,7 @@ def compression_quality_index(
 
 # Backward-compatible alias - internal callers use this name.
 # New external code should call CQI() directly.
-_efficiency_score = CQI
+_efficiency_score = compression_quality_index
 
 
 # ============================================================================
@@ -764,7 +764,7 @@ def _evaluate_epsilon(
         # passes regardless of whether fine_tune_epochs is 0 or N.
         latency_ms = baseline_latency_ms   # neutral: latency factor = 1.0 in CQI
         
-        score      = CQI(
+        score      = compression_quality_index(
             accuracy, size_mb, baseline_accuracy, baseline_size,
             # omit latency to avoid measuring 13 forward passes per trial
             accuracy_drop_threshold=accuracy_drop_threshold,
@@ -966,7 +966,7 @@ def _evaluate_pruning_config(
         if probe.get('metric') == 'kl_divergence' and kl_val is not None:
             kl_divergence = float(kl_val)
 
-        score = CQI(
+        score = compression_quality_index(
             accuracy, size_mb, baseline_accuracy, baseline_size,
             latency_ms, baseline_latency_ms,
             kl_divergence=kl_divergence,
