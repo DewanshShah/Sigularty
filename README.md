@@ -21,7 +21,8 @@ Constants used for each one (Better results can be achieved by using a better le
 | `Resnet50` | **2.20%** | **8.00x** | **9.897** | **1.28x** | 90.66 -> 11.34 | 66.60 -> 64.40 | 6.977 -> 5.451 |
 | `vit_b_16` | **0.00%** | **4.51×** | **4.526**| **1.00x** | 327.59 -> 72.67 | 77.00 -> 77.00 | 14.96 -> 14.90 |
 | `efficientnet_b0` | **2.80%** | **2.61x** | **2.284**| **0.90x** | 15.95 -> 6.11 | 91.80 -> 89.00 | 8.238 -> 9.124|
-| `bert_base` | **8.60%** | **5.47x** | **3.67** | **0.74x** | 417.66 -> 76.37 | 90.60 -> 82.00 | 10.309 -> 13.873 |
+| `bert_base` | **0.20%** | **4.76x** | **3.951** | **0.83x** | 417.66 -> 87.76 | 90.40 -> 90.20 | 11.400 -> 13.702 |
+| `distilbert` | **5.60%** | **9.55x** | **7.049** | **0.78x** | 255.42 -> 26.75 | 82.40 -> 76.80 | 5.441 -> 6.957 |
 
 ---
 
@@ -107,20 +108,18 @@ teacher, so it can recover accuracy lost from every prior step at once.
 Quantization is always last among the structural/precision techniques (KD runs
 after it specifically to recover what quantization cost).
 
-**Two-phase optimization:**
-The pipeline internally uses two phases during optimization: Phase A generates
-a float32 baseline for hyperparameter search, and Phase B applies quantization
-on top for final compression.
-
-- **Phase A**: BN Fusion + Pruning + LRF + Clustering → float32 (gated internally
-  by `apply_compression_pipeline`)
-- **Phase B**: GPTQ → Quantization → final KD recovery, each gated individually
-  in `run_compression_pipeline` (these run outside `apply_compression_pipeline`
-  entirely, so they need their own gating calls)
+**Where each technique is gated:**
+BN Fusion, Pruning, LRF, and Clustering run inside `apply_compression_pipeline`,
+which gates Pruning, LRF, and Clustering internally (BN Fusion is never gated).
+GPTQ, Quantization, and the final KD recovery run after it in
+`run_compression_pipeline` and are each gated individually there, since they
+run outside `apply_compression_pipeline` entirely and need their own gating
+calls. Dynamic INT8 quantization has no CUDA kernel, which is why quantization
+is applied after the float32 stages: latency comparisons stay fair.
 
 All evaluation metrics (accuracy, size, and latency) are measured on the final
-model (Phase B output). This ensures fair comparison: you're evaluating the
-actual model that will be deployed, not an intermediate representation.
+compressed model, so you are evaluating the model that will actually be
+deployed, not an intermediate one.
 
 ---
 
@@ -181,7 +180,7 @@ catches anything interesting for it specifically.
   returned model.
 - `helper_functions.py`: `run_compression_pipeline()` calls the same gate
   function around GPTQ, standard Quantization, and the final KD step, since
-  those run OUTSIDE `apply_compression_pipeline` in the two-phase design above.
+  those run OUTSIDE `apply_compression_pipeline`, after it returns.
 
 **Configuration constants in main.py:**
 ```python
@@ -345,8 +344,7 @@ to capture the pre-fine-tune snapshot the algorithm/fine-tune split needs.
   `orig_size_mb`/`orig_latency_ms` once, immediately alongside its existing
   once-only `orig_accuracy` measurement, and threads all three into
   `apply_compression_pipeline()` and its own GPTQ/Quantization/final-KD
-  impact reports (which run outside `apply_compression_pipeline` in the
-  two-phase design - see above).
+  impact reports (which run outside `apply_compression_pipeline`, after it returns).
 
 ---
 
@@ -1676,7 +1674,7 @@ are force-disabled automatically if the active model contains
 [LRF + nn.MultiheadAttention Safety](#lrf--nnmultiheadattention-safety)).
 
 **What it does:** Finds the LRF epsilon that maximizes the Compression Quality Index
-across accuracy, size, and (optionally) latency.
+across accuracy, size, and latency.
 
 **Algorithm - anchor sampling + ternary search:**
 ```
@@ -1711,6 +1709,15 @@ ACCURACY_DROP_THRESHOLD   = 10.0   # global - see dedicated section above
 - At 30 trials: 5 anchors + 12 iterations. More precise narrow range.
 - At 10 trials: Only 2-3 ternary iterations. May not converge.
 
+**Latency per trial:** every trial (anchor or ternary) measures accuracy,
+size, and latency on the factorized model, using 10 timed iterations after 3
+warmup passes and the same input shape and dtype as the baseline measurement
+(`input_dtype=torch.long` for NLP models). That adds roughly 13 short forward
+passes per trial. If the winning epsilon's score is below 1.0 - possible when
+the latency penalty outweighs the size reduction - the search returns `None`
+and LRF is disabled for the run, with a warning that lists the size and
+latency numbers behind the score.
+
 **Why no proxy model for epsilon search:**
 The original design included an INT8 proxy model to speed up search. The proxy
 always runs on CPU (no CUDA INT8 Conv2d kernel). For EfficientNet-B0 at 1-sample
@@ -1719,7 +1726,10 @@ epsilon search take 10× longer, which defeats the purpose entirely. All epsilon
 search evaluations run on the real model on the GPU.
 
 **Results are cached to `epsilon_cache.json`** for crash recovery. If the search
-is interrupted and restarted, it resumes from cached evaluations.
+is interrupted and restarted, it resumes from cached evaluations. Cached scores
+are stored per epsilon with no record of which CQI weights or latency settings
+produced them, so delete `epsilon_cache.json` whenever you change `CQI_W_*`
+constants or the latency measurement, or old scores will be mixed with new ones.
 
 ---
 
@@ -1760,6 +1770,11 @@ significant correctness change in this version of the search.
 **Structural-failure abort:** shares the same 2-consecutive-failure protocol as
 the epsilon search, via a single internal choke-point every phase calls through.
 
+**Latency per trial:** every trial measures latency on the pruned model (10
+timed iterations, 3 warmup) and scores it against a baseline measured the same
+way, so the ranking reflects speed as well as size and accuracy. The max-ratio
+grid and the final-ranking table print each config's latency.
+
 **CQI with KL divergence:**
 The pruning search includes KL divergence in the scoring:
 ```
@@ -1779,7 +1794,9 @@ PRUNING_SEARCH_NUM_TRIALS = 15
 ACCURACY_DROP_THRESHOLD   = 10.0   # global - see dedicated section above
 ```
 
-**Results cached to `pruning_search_cache.json`** for crash recovery.
+**Results cached to `pruning_search_cache.json`** for crash recovery. Delete it
+whenever you change CQI weights or other scoring inputs, for the same reason as
+the epsilon cache.
 
 ---
 
@@ -1805,8 +1822,22 @@ superlinearly:
 **Interpretation:**
 - CQI = 1.0: No improvement over original model (all ratios = 1.0)
 - CQI = 2.0: Twice as good on the combined weighted tradeoff
-- CQI = 0.5: Half as good - net loss from compression (viability threshold)
-- CQI < 0.5: Compression is causing more harm than good; search returns None
+- CQI = 0.5: Half as good - a clear net loss from compression
+- CQI < 1.0: Compression is a net loss on the combined tradeoff; the search returns None
+
+**Latency during the searches:** both hyperparameter searches measure real
+latency on every trial (10 timed iterations, 3 warmup, against a baseline
+measured the same way), so the latency factor above is live during search, not
+neutral. LRF replaces each factorized layer with two layers, which means extra
+kernel launches: on launch-bound models (small batch, many small layers -
+EfficientNet, BERT-style stacks) an epsilon can shrink the model and still run
+slower than the original, and the search now scores it that way. Size and
+latency are both plain ratios raised to their weights, so a large size win can
+still outweigh a moderate slowdown - for example 1.5x smaller at 0.85x speed
+scores about 1.84 x 0.85 = 1.56 with `CQI_W_SIZE=1.5` and `CQI_W_LATENCY=1.0`,
+and is kept. Raise `CQI_W_LATENCY` if you want the searches to reject that
+trade. The per-technique accuracy gate is unchanged and still checks accuracy
+only; nothing in the pipeline reverts a technique for being slower.
 
 **These weights are yours to tune - the toolkit will never adjust them
 automatically.** If a high `CQI_W_SIZE` causes raw scores to favor a
@@ -2229,9 +2260,9 @@ and latency once each for reuse throughout (size/latency are new - measured
 alongside the pre-existing once-only baseline accuracy, specifically so
 every per-technique impact report's "cumulative vs. original" numbers share
 one true-original reference), runs the (optional) pruning/epsilon searches,
-runs Phase A (`apply_compression_pipeline`, gated, with impact reporting)
-and Phase B (GPTQ → Quantization → final KD, each gated and impact-reported
-here directly), then evaluates and reports.
+runs `apply_compression_pipeline` (gated, with impact reporting), then
+GPTQ → Quantization → final KD, each gated and impact-reported here directly,
+then evaluates and reports.
 
 ---
 
@@ -2242,8 +2273,9 @@ The single shared metric for all search and reporting. Returns float CQI ≥ 0.
 
 ### `find_optimal_epsilon_smart(model, test_loader, device, baseline_accuracy, baseline_size, baseline_latency_ms, tolerance, num_trials, cache_path, min_layer_size, input_shape, w_accuracy, w_size, w_latency, accuracy_drop_threshold)`
 Anchor + ternary search for best LRF epsilon. Returns (optimal_epsilon, all_results, history).
-`optimal_epsilon` is `None` if best CQI < 0.5, or if nothing survived the
-2-consecutive-structural-failure abort protocol.
+`optimal_epsilon` is `None` if the best score is below 1.0 (no better than not
+compressing), or if nothing survived the 2-consecutive-structural-failure abort
+protocol. Every trial measures latency (see the epsilon search section).
 
 ### `find_optimal_pruning_params(model, dataloader, test_loader, device, baseline_accuracy, baseline_size, baseline_latency_ms, num_trials, cache_path, model_type, num_classes, num_calibration_batches, max_pruning_ratio, residual_max_ratio=None, round_to, isomorphic, input_shape, w_accuracy, w_size, w_latency, w_kl, accuracy_drop_threshold, search_ft_epochs, search_ft_lr)`
 Four-phase search for pruning_ratio, max_pruning_ratio, iterative_steps -
@@ -2386,6 +2418,20 @@ abort), but if this happens on every run for a given model, that model likely
 has a fundamental incompatibility with the technique being searched (check for
 patterns like the `nn.MultiheadAttention` case, or verify `num_classes` /
 input shape are actually correct for this model).
+
+**Search results don't change after editing CQI weights or latency settings**
+Both searches cache trial results on disk (`epsilon_cache.json`,
+`pruning_search_cache.json`, or `.sigularty_cache/` when using `compress()`)
+keyed only by hyperparameter value. Cached scores were computed under whatever
+weights and latency settings were active when they were written, and are reused
+as-is. Delete the cache files after changing scoring inputs.
+
+**LRF or pruning gets disabled by its search with a score below 1.0**
+The search judged the technique worse than not compressing once size, accuracy,
+and latency are combined. On launch-bound models LRF often shrinks the model
+while slowing it down; the warning lists the winner's size and latency against
+the baseline. Raise `CQI_W_SIZE` or lower `CQI_W_LATENCY` only if you are
+deliberately optimizing for size over speed.
 
 **Shape mismatch after pruning then LRF**
 If you prune AFTER LRF (wrong order), the dependency graph trace fails because

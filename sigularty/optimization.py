@@ -9,10 +9,10 @@ Public API
       -> (float | None, dict, list)
   find_optimal_pruning_params(model, dataloader, test_loader, device, ..., num_trials)
       -> (dict | None, dict, list)
-  CQI(accuracy, size_mb, baseline_accuracy, baseline_size,
-                             latency_ms=None, baseline_latency_ms=None,
-                             kl_divergence=None,
-                             w_accuracy=1.0, w_size=1.0, w_latency=1.0, w_kl=1.0)
+  compression_quality_index(accuracy, size_mb, baseline_accuracy, baseline_size,
+                            latency_ms=None, baseline_latency_ms=None,
+                            kl_divergence=None,
+                            w_accuracy=1.0, w_size=1.0, w_latency=1.0, w_kl=1.0)
       -> float   [public; used everywhere: search, visualization, compression report]
 
 Compression Quality Index (CQI)
@@ -32,6 +32,14 @@ Compression Quality Index (CQI)
 
   This metric is used everywhere: epsilon search, pruning search, and the
   compression report visualization.
+
+  Latency is measured for every search trial (10 timed iterations, 3 warmup,
+  against a baseline measured with the same settings), so a configuration
+  that shrinks the model but makes it slower is scored below one that does
+  the same without the slowdown. The latency factor is a plain ratio raised
+  to w_latency, exactly like the size factor - a large enough size win can
+  still outweigh a slowdown. Raise w_latency to make the searches stricter
+  about speed.
 
 Proxy Model Infrastructure
 ---------------------------
@@ -73,10 +81,10 @@ num_trials Budget Allocation
     n_anchors       = min(5, search_budget)
     n_ternary_iters = max(0, search_budget - n_anchors) // 2
     NOTE: num_trials controls the NUMBER of trials only. Each trial's OWN
-    cost now also depends on search_ft_epochs (see "Per-Trial Fine-Tuning"
-    below) - 0 (default off) reproduces the original near-instant-per-trial
-    behaviour; >0 multiplies every trial's cost by roughly that many real
-    training epochs.
+    cost also depends on search_ft_epochs (see "Per-Trial Fine-Tuning"
+    below) - 0 (default off) means each trial is one factorization, one
+    accuracy pass, and one short latency measurement; >0 multiplies every
+    trial's cost by roughly that many real training epochs.
 
   Pruning search:
     proxy_budget    = 2  (deducted when proxy available)
@@ -86,18 +94,16 @@ num_trials Budget Allocation
     iter_budget     = 1
     leftover added to grid_budget
 
-Per-Trial Fine-Tuning & Early-Abort Multiplier
+Per-Trial Fine-Tuning & Early-Abort Threshold
 -------------------------------------------------
-  Pruning search has always fine-tuned every trial (via
-  apply_structured_pruning's fine_tune_epochs/fine_tune_lr). Epsilon search
-  did NOT - _evaluate_epsilon applied LRF and measured accuracy immediately,
-  by design, to keep trials fast. search_ft_epochs (find_optimal_epsilon_
-  smart) makes epsilon-search fine-tuning OPT-IN: 0 (default) preserves the
-  original fast behaviour; >0 routes each trial through
-  apply_low_rank_factorization's own existing fine-tune mechanism, the same
-  one the main pipeline's LRF step already uses. This is a genuine,
-  multiplicative cost increase for epsilon search specifically - see
-  find_optimal_epsilon_smart's docstring for the exact tradeoff.
+  Pruning search fine-tunes every trial (via apply_structured_pruning's
+  fine_tune_epochs/fine_tune_lr). Epsilon search fine-tunes only when
+  search_ft_epochs > 0: 0 (default) applies LRF and measures immediately,
+  which is fast; >0 routes each trial through apply_low_rank_factorization's
+  own fine-tune mechanism, the same one the main pipeline's LRF step uses.
+  This is a genuine, multiplicative cost increase for epsilon search
+  specifically - see find_optimal_epsilon_smart's docstring for the exact
+  tradeoff.
 
   Both search functions accept early_abort_threshold: a direct percentage-
   point value, not a multiplier. After epoch 1 of ANY trial's fine-tune, if
@@ -107,9 +113,9 @@ Per-Trial Fine-Tuning & Early-Abort Multiplier
   much ground in the epochs left over is judged implausible, so finishing
   the fine-tune would only spend compute on a result the trial's own
   scoring would rank poorly anyway. None (default) disables this - every
-  trial's fine-tune always runs to completion, exactly as before. This is
-  deliberately independent of accuracy_drop_threshold - changing one does
-  not silently move the other.
+  trial's fine-tune always runs to completion. This is deliberately
+  independent of accuracy_drop_threshold - changing one does not silently
+  move the other.
 
   This is intentionally a DIFFERENT mechanism from the Structural-Failure
   Abort Protocol below - early-abort fires on a degraded-but-VALID accuracy
@@ -141,6 +147,14 @@ Structural-Failure Abort Protocol
   pruning), which always operates by pooling the entire cache rather than
   assuming any particular phase completed.  A single isolated failure does
   NOT abort anything - it is skipped and the search moves to the next trial.
+
+Cache validity
+--------------
+  Cached trial results are keyed by hyperparameter value only and store the
+  score computed under the CQI settings active when they were written.
+  Delete cache files whenever the scoring inputs change (for example when
+  latency measurement is switched on or off, or CQI weights change), or old
+  scores will be mixed with new ones under the same keys.
 
 Design rules
 ------------
@@ -208,8 +222,7 @@ def _save_cache(cache: dict, cache_path: str) -> None:
 # ── SELECTION HELPER - accuracy-tiered "best by score" ──────────────────────
 # Shared by every phase of find_optimal_pruning_params() so refinement,
 # grid search, and the iterative-steps comparison all respect the accuracy
-# drop threshold the same way Phase 1's anchor selection already did,
-# instead of only gating at the very end.
+# drop threshold the same way Phase 1's anchor selection does.
 # ============================================================================
 
 def _select_best_by_tier(
@@ -327,7 +340,7 @@ def _accuracy_barrier_factor(
     if x < 0.0:
         t = -x
         return 1.0 + (ceiling - 1.0) * t / (1.0 + t)
-    
+
     if x < 1.0:
         return 1.0 - penalty_slope * x
     return (2.0 - penalty_slope) - math.exp(penalty_steepness * (x - 1.0))
@@ -364,14 +377,14 @@ def compression_quality_index(
 
     Backward compatibility: when accuracy_drop_threshold is NOT supplied
     (None, the default) or is <= 0, this falls back to the legacy
-    (accuracy / baseline_accuracy) ** w_accuracy ratio - unchanged from
-    every prior version of this function. This lets any caller not yet
-    updated to pass accuracy_drop_threshold keep working exactly as
-    before; passing accuracy_drop_threshold is what opts a call site into
-    the new barrier behaviour.
+    (accuracy / baseline_accuracy) ** w_accuracy ratio. Passing
+    accuracy_drop_threshold is what opts a call site into the barrier
+    behaviour.
 
-    size/latency/kl factors are UNCHANGED from the original formula -
-    still simple ratios raised to their respective weight exponents.
+    The size, latency, and KL factors are simple ratios raised to their
+    respective weight exponents. The latency factor is below 1.0 whenever
+    the compressed model is slower than the baseline, and a larger
+    w_latency makes that penalty steeper.
 
     Args:
         accuracy:              Compressed model top-1 accuracy (%).
@@ -404,11 +417,11 @@ def compression_quality_index(
         w_kl:                    KL divergence penalty weight (default 1.0).
 
     Returns:
-        CQI (float). Under the new barrier accuracy factor, CQI can be
+        CQI (float). Under the barrier accuracy factor, CQI can be
         negative - this is intentional and unambiguous: a negative CQI
         means the accuracy drop alone has already made this configuration
         worse than doing nothing, regardless of how good size/latency/kl
-        are. Under the legacy fallback path, CQI stays >= 0 as before.
+        are. Under the legacy fallback path, CQI stays >= 0.
         Returns 0.0 on degenerate inputs (baseline_accuracy<=0 or size_mb<=0).
     """
     if baseline_accuracy <= 0.0 or size_mb <= 0.0:
@@ -423,10 +436,8 @@ def compression_quality_index(
             penalty_steepness=accuracy_penalty_steepness,
         )
     else:
-        # Legacy fallback - unchanged behaviour for callers not yet passing
-        # accuracy_drop_threshold.
         acc_factor = (accuracy / baseline_accuracy) ** w_accuracy
-        
+
     size_ratio = baseline_size / size_mb
     cqi = acc_factor * (size_ratio ** w_size)
 
@@ -444,8 +455,7 @@ def compression_quality_index(
     return cqi
 
 
-# Backward-compatible alias - internal callers use this name.
-# New external code should call CQI() directly.
+# Alias used by internal callers.
 _efficiency_score = compression_quality_index
 
 
@@ -618,13 +628,13 @@ def _evaluate_epsilon(
     cache: dict,
     input_shape: tuple = (1, 3, 224, 224),
     latency_iters: int = 10,
+    input_dtype: Optional[torch.dtype] = None,
     w_accuracy: float = 1.0,
     w_size: float = 1.0,
     w_latency: float = 1.0,
     min_rank: int = 1,
     skip_large_kernels: bool = False,
-    # ── Per-trial fine-tuning (opt-in - 0 epochs reproduces the old,
-    #    fine-tune-free behaviour exactly) ────────────────────────────────────
+    # ── Per-trial fine-tuning (0 epochs = no fine-tune) ──────────────────────
     dataloader: Optional[DataLoader] = None,
     num_classes: Optional[int] = None,
     fine_tune_epochs: int = 0,
@@ -636,28 +646,30 @@ def _evaluate_epsilon(
     Evaluate a single LRF epsilon value.
 
     Checks in-memory cache first (str(round(epsilon, 4)) key).
-    On cache miss: applies LRF, OPTIONALLY fine-tunes (see below), measures
-    accuracy + size + latency, computes three-factor efficiency score,
-    stores in cache.
+    On cache miss: applies LRF, optionally fine-tunes (see below), measures
+    accuracy, size, and latency, computes the CQI score, and stores it in
+    the cache.
 
-    PER-TRIAL FINE-TUNING (opt-in, fine_tune_epochs=0 by default):
-      Originally this function never fine-tuned - it applied LRF and
-      measured accuracy immediately, by design, to keep epsilon search fast
-      (~13 forward passes saved per trial by also skipping latency
-      measurement; see below). fine_tune_epochs > 0 routes through
-      apply_low_rank_factorization's OWN existing fine_tune_epochs/
-      fine_tune_lr mechanism (the same one the main pipeline's LRF step
-      already uses) - this function does not implement a separate fine-tune
-      loop, it just stops leaving those arguments at their defaults.
+    LATENCY: measured on the factorized model with latency_iters timed
+    forward passes (3 warmup), using the same settings the baseline latency
+    was measured with, so the ratio baseline/trial is directly comparable.
+    LRF replaces each factorized layer with two layers, which means extra
+    kernel launches, so a trial can shrink the model and still be slower
+    than the baseline; the latency factor in the score reflects that.
+    latency_iters <= 0 skips the measurement and uses baseline_latency_ms,
+    which makes the latency factor exactly 1.0.
 
-      Cost warning: this is a real, multiplicative cost increase, not a
-      free improvement. EPSILON_SEARCH_FT_EPOCHS × num_trials extra training
-      epochs are now possible where zero existed before - on a large model
-      this can turn a near-instant search into one that takes as long as a
-      pruning search with similar settings. The early_abort_threshold
-      below blunts the WORST case (clearly-bad epsilons abort after epoch
-      1) but does not eliminate the added cost for epsilons that look
-      viable through a full fine-tune.
+    PER-TRIAL FINE-TUNING (fine_tune_epochs=0 by default):
+      fine_tune_epochs > 0 routes through apply_low_rank_factorization's own
+      fine_tune_epochs/fine_tune_lr mechanism (the same one the main
+      pipeline's LRF step uses) - this function does not implement a
+      separate fine-tune loop.
+
+      Cost: EPSILON_SEARCH_FT_EPOCHS × num_trials training epochs. On a
+      large model this can make the search as slow as a pruning search with
+      similar settings. early_abort_threshold blunts the worst case
+      (clearly-bad epsilons abort after epoch 1) but does not remove the
+      cost for epsilons that look viable through a full fine-tune.
 
       `dataloader`/`num_classes` are required (non-None) for fine-tuning to
       actually run - exactly mirroring apply_low_rank_factorization's own
@@ -676,11 +688,11 @@ def _evaluate_epsilon(
                               used as the fine-tune's KD teacher (via
                               apply_low_rank_factorization's own default -
                               not passed explicitly here).
-        test_loader:          Evaluation DataLoader.  ALSO the early-abort
+        test_loader:          Evaluation DataLoader.  Also the early-abort
                               check's test-set source when fine-tuning runs.
         device:               Compute device.
         epsilon:              LRF rank ratio in (0.0, 1.0].
-        baseline_accuracy:    Original accuracy % (for score, AND for the
+        baseline_accuracy:    Original accuracy % (for score, and for the
                               early-abort check's drop calculation - same
                               number, since this search's "baseline" already
                               IS the absolute original model's accuracy).
@@ -688,21 +700,24 @@ def _evaluate_epsilon(
         baseline_latency_ms:  Original latency ms (for score).
         min_layer_size:       Passed to apply_low_rank_factorization.
         cache:                In-memory cache (mutated on miss).
-        input_shape:          Dummy input for latency measurement.
-        latency_iters:        Timed forward passes (keep small during search).
+        input_shape:          Dummy input shape for latency measurement.
+        latency_iters:        Timed forward passes per trial (keep small
+                              during search). 0 = skip latency measurement.
+        input_dtype:          Dummy input dtype for latency measurement.
+                              None = float32 (vision default); torch.long for
+                              NLP token-ID inputs.
         dataloader:           Training/calibration DataLoader for the optional
                               per-trial fine-tune.  None = fine-tuning skipped
                               regardless of fine_tune_epochs (matches
                               apply_low_rank_factorization's own contract).
         num_classes:          Output class count for the optional fine-tune.
         fine_tune_epochs:     KD recovery epochs per trial.  0 (default) =
-                              old behaviour, no fine-tune, fastest.
+                              no fine-tune, fastest.
         fine_tune_lr:         Learning rate for the optional fine-tune.
-        accuracy_drop_threshold: pp threshold used for scoring/selection AND
-                              (new) as CQI's own
-                              accuracy_drop_threshold, so this search's
-                              scores use the barrier accuracy factor rather
-                              than the legacy ratio.
+        accuracy_drop_threshold: pp threshold used for scoring/selection and
+                              as CQI's own accuracy_drop_threshold, so this
+                              search's scores use the barrier accuracy factor
+                              rather than the legacy ratio.
         early_abort_threshold: Direct pp value - "abort if epoch-1 drop
                               exceeds this many percentage points". Not a
                               multiplier on accuracy_drop_threshold. None =
@@ -719,8 +734,8 @@ def _evaluate_epsilon(
                       "No samples were evaluated").  This is intentionally
                       NOT swallowed here - the caller (find_optimal_epsilon_smart)
                       counts these toward the 2-consecutive-failure abort.
-                      This can now also originate from the early-abort check's
-                      OWN measure_accuracy() call when fine-tuning runs, since
+                      This can also originate from the early-abort check's
+                      own measure_accuracy() call when fine-tuning runs, since
                       that call uses the exact same function and propagation
                       rule - a mid-fine-tune structural failure is treated
                       identically to a post-fine-tune one.
@@ -750,25 +765,20 @@ def _evaluate_epsilon(
         size_mb  = get_model_size_mb(compressed)
         accuracy = measure_accuracy(compressed, test_loader, device)
 
-        # ⚠️  LATENCY IS INTENTIONALLY NOT MEASURED PER-EPSILON
-        # Reason: LRF (low-rank factorization) increases kernel count regardless of epsilon.
-        #   Original:  W (one kernel) 
-        #   LRF:       U @ V (two kernels, even for high rank)
-        # Therefore, latency barely varies with epsilon (all epsilons ≈ same latency).
-        # The two-factor score (accuracy × size) is sufficient for epsilon selection.
-        # Actual per-epsilon latency IS measured once in the final pipeline on the 
-        # winning config, where real-world speedup or regression is visible.
-        # This design saves ~13 forward passes per trial (10 warmup + 10 iterations × 2 kernels).
-        # NOTE: this rationale is independent of (and unaffected by) the optional
-        # per-trial fine-tuning above - skipping latency saves a fixed ~13 forward
-        # passes regardless of whether fine_tune_epochs is 0 or N.
-        latency_ms = baseline_latency_ms   # neutral: latency factor = 1.0 in CQI
-        
-        score      = compression_quality_index(
+        if latency_iters > 0:
+            lat = measure_latency(
+                compressed, input_shape, device,
+                num_iterations=latency_iters, warmup=3, input_dtype=input_dtype,
+            )
+            latency_ms = lat['mean_ms']
+        else:
+            latency_ms = baseline_latency_ms   # neutral: latency factor = 1.0
+
+        score = compression_quality_index(
             accuracy, size_mb, baseline_accuracy, baseline_size,
-            # omit latency to avoid measuring 13 forward passes per trial
+            latency_ms, baseline_latency_ms,
             accuracy_drop_threshold=accuracy_drop_threshold,
-            w_accuracy=w_accuracy, w_size=w_size,
+            w_accuracy=w_accuracy, w_size=w_size, w_latency=w_latency,
         )
     except RuntimeError as exc:
         if 'No samples were evaluated' in str(exc):
@@ -781,13 +791,9 @@ def _evaluate_epsilon(
     except (TypeError, AttributeError, NameError, ImportError):
         # These are almost always programmer errors (wrong/missing kwargs,
         # typos, a missing import) rather than a legitimate "this epsilon
-        # doesn't work" result. Silently scoring them as accuracy=0.0 would
-        # hide a real bug behind a fake "LRF makes this model worse" search
-        # conclusion - exactly what happened when apply_low_rank_factorization
-        # didn't yet accept test_loader/baseline_accuracy/accuracy_drop_
-        # threshold/early_abort_threshold and every trial TypeError'd here.
-        # Let it propagate and crash loudly instead of laundering it into
-        # experimental data.
+        # doesn't work" result. Scoring them as accuracy=0.0 would hide a
+        # real bug behind a fake "LRF makes this model worse" search
+        # conclusion, so they propagate and crash loudly instead.
         raise
     except Exception as exc:
         print(f"  ⚠️  Failed to evaluate ε={epsilon:.4f}: {exc}")
@@ -853,10 +859,15 @@ def _evaluate_pruning_config(
     cacheable.  (max_pruning_ratio is included because Phase 2 searches it
     too; omitting it would let same-ratio/different-cap trials collide.)
 
+    LATENCY: measured on the pruned model with latency_iters timed forward
+    passes (3 warmup) and scored against baseline_latency_ms. latency_iters
+    <= 0 skips the measurement and uses baseline_latency_ms, which makes the
+    latency factor exactly 1.0.
+
     Args:
         model:                  Base model (never modified - deepcopy inside pruning).
         dataloader:             DataLoader for pruning calibration and fine-tuning.
-        test_loader:            DataLoader for accuracy evaluation.  ALSO the
+        test_loader:            DataLoader for accuracy evaluation.  Also the
                                 early-abort check's test-set source - see
                                 accuracy_drop_threshold/early_abort_threshold.
         device:                 Compute device.
@@ -864,7 +875,7 @@ def _evaluate_pruning_config(
         fine_tune_epochs:       Fine-tune epochs after pruning (0 = skip).
         fine_tune_lr:           Fine-tune learning rate.
         iterative_steps:        Torch-Pruning iterative steps.
-        baseline_accuracy:      Original accuracy % (for score). ALSO the
+        baseline_accuracy:      Original accuracy % (for score). Also the
                                 early-abort check's drop reference - this
                                 search's "baseline" already IS the absolute
                                 original model, so no separate value needed.
@@ -876,16 +887,17 @@ def _evaluate_pruning_config(
         num_classes:            Output classes for fine-tune accuracy metric.
         num_calibration_batches: Calibration batches for importance collection.
         max_pruning_ratio:      Hard cap per group (passed to MetaPruner).
+        residual_max_ratio:     Ceiling for auto-detected residual groups.
         round_to:               Round pruned channels to this multiple.
         isomorphic:             Force same structure on all coupled groups.
-        input_shape:            Dummy input for latency measurement.
-        latency_iters:          Timed forward passes (keep small).
-        accuracy_drop_threshold: pp threshold used for scoring/selection AND
-                                (new) as CQI's own
-                                accuracy_drop_threshold - same effect as in
-                                _evaluate_epsilon above. Passed straight
-                                through to apply_structured_pruning's KD
-                                recovery fine-tune as before.
+        input_shape:            Dummy input shape for latency measurement.
+        input_dtype:            Dummy input dtype for latency measurement.
+        latency_iters:          Timed forward passes (keep small). 0 = skip.
+        accuracy_drop_threshold: pp threshold used for scoring/selection and
+                                as CQI's own accuracy_drop_threshold - same
+                                effect as in _evaluate_epsilon above. Passed
+                                straight through to apply_structured_pruning's
+                                KD recovery fine-tune.
         early_abort_threshold: Direct pp value - "abort this trial's
                                 fine-tune after epoch 1 if its drop exceeds
                                 this many percentage points." Not a
@@ -904,7 +916,7 @@ def _evaluate_pruning_config(
                       counts these toward the 2-consecutive-failure abort.
     """
 
-    # max_pruning_ratio is now a searched variable, so it must be in the cache key
+    # max_pruning_ratio is a searched variable, so it must be in the cache key
     # to avoid collisions between evaluations with the same ratio but different cap.
     cache_key = (
         f"{round(pruning_ratio,     4)}"
@@ -946,8 +958,6 @@ def _evaluate_pruning_config(
         torch_pruning_incompatible = _report.get('torch_pruning_incompatible', False)
         size_mb    = get_model_size_mb(pruned)
         accuracy   = measure_accuracy(pruned, test_loader, device)
-        # latency_iters=0 means skip latency measurement during search (use baseline).
-        # This saves 13 forward passes per trial.  Final pipeline measures latency properly.
         if latency_iters > 0:
             lat        = measure_latency(
                 pruned, input_shape, device,
@@ -987,9 +997,7 @@ def _evaluate_pruning_config(
     except (TypeError, AttributeError, NameError, ImportError):
         # Same reasoning as _evaluate_epsilon: these are almost always a
         # wrong/missing kwarg or a typo in the calling code, not a genuine
-        # "this pruning config doesn't work" result. Propagate instead of
-        # silently scoring accuracy=0.0 and letting the search conclude
-        # "pruning makes this model worse" based on a crash, not real data.
+        # "this pruning config doesn't work" result, so they propagate.
         raise
     except Exception as exc:
         print(f"  ⚠️  Pruning eval failed "
@@ -1045,8 +1053,8 @@ def find_optimal_epsilon_smart(
     w_size: float = 1.0,
     w_latency: float = 1.0,
     accuracy_drop_threshold: float = 5.0,
-    # ── Per-trial fine-tuning (opt-in - see _evaluate_epsilon's docstring
-    #    for the cost tradeoff this introduces) ───────────────────────────────
+    # ── Per-trial fine-tuning (see _evaluate_epsilon's docstring for the
+    #    cost tradeoff this introduces) ───────────────────────────────────────
     dataloader: Optional[DataLoader] = None,
     num_classes: Optional[int] = None,
     search_ft_epochs: int = 0,
@@ -1058,32 +1066,35 @@ def find_optimal_epsilon_smart(
 
     accuracy_drop_threshold: max allowed accuracy drop (pp). Anchor for refinement
     uses threshold+10pp; final selection uses strict threshold. Also passed
-    straight through to CQI as its own
-    accuracy_drop_threshold, so every score computed by this search uses the
-    barrier accuracy factor (see CQI's docstring)
-    rather than the legacy w_accuracy-exponent ratio.
+    straight through to CQI as its own accuracy_drop_threshold, so every
+    score computed by this search uses the barrier accuracy factor (see
+    CQI's docstring) rather than the legacy w_accuracy-exponent ratio.
 
     Uses the Compression Quality Index (CQI) to rank epsilon candidates.
-    CQI weights control how much each factor (accuracy, size) influences ranking.
-    Latency is not measured during search (scores are neutral on that axis)
-    so w_latency has no effect here - it is accepted for API consistency.
+    Every trial measures accuracy, size, and latency, so the score reflects
+    all three: an epsilon that shrinks the model but makes it slower than
+    the baseline is penalized by the latency factor, scaled by w_latency.
+    LRF turns each factorized layer into two layers (two kernel launches
+    instead of one), so on launch-bound models even a moderate epsilon can
+    run slower than the original.
 
-    PER-TRIAL FINE-TUNING (opt-in via search_ft_epochs, default 0):
-      Historically this search never fine-tuned - every trial applied LRF
-      and measured accuracy immediately. search_ft_epochs > 0 changes that:
-      every anchor AND every ternary-refinement trial now also runs a real
-      KD recovery fine-tune (via apply_low_rank_factorization's own existing
-      mechanism - see _evaluate_epsilon) before its accuracy is measured.
+    Viability: if the winning epsilon's score is below 1.0, factorization is
+    judged worse than not compressing at all and the search returns None.
 
-      THIS IS A REAL COST INCREASE, NOT A FREE IMPROVEMENT. With
-      search_ft_epochs=0 (default), num_trials trials cost ~num_trials
-      forward-pass-only evaluations (seconds each). With search_ft_epochs=N,
-      the cost becomes ~num_trials × N real training epochs - on a large
+    PER-TRIAL FINE-TUNING (search_ft_epochs, default 0):
+      With search_ft_epochs=0 every trial applies LRF and measures
+      immediately. search_ft_epochs > 0 makes every anchor and every
+      ternary-refinement trial also run a real KD recovery fine-tune (via
+      apply_low_rank_factorization's own mechanism - see _evaluate_epsilon)
+      before its accuracy is measured.
+
+      With search_ft_epochs=0, num_trials trials cost roughly num_trials
+      short evaluations (seconds each). With search_ft_epochs=N, the cost
+      becomes roughly num_trials × N real training epochs - on a large
       model this can take as long as a pruning search with comparable
-      settings, where it previously took a small fraction of that time.
-      early_abort_threshold (below) caps the WORST case - a clearly-bad
-      epsilon aborts its fine-tune after epoch 1 - but does not eliminate
-      the cost for epsilons that look viable through every epoch.
+      settings. early_abort_threshold (below) caps the worst case - a
+      clearly-bad epsilon aborts its fine-tune after epoch 1 - but does not
+      remove the cost for epsilons that look viable through every epoch.
 
       dataloader/num_classes must both be supplied (non-None) for any
       fine-tuning to actually happen, mirroring
@@ -1105,7 +1116,7 @@ def find_optimal_epsilon_smart(
     stops immediately and proceeds straight to Phase 3's final selection
     using whatever was cached before the abort.  If literally zero trials
     ever succeeded, this returns (None, {'warning': ...}, history) instead
-    of crashing.  (When search_ft_epochs > 0, this can now also be raised
+    of crashing.  (When search_ft_epochs > 0, this can also be raised
     from inside a trial's fine-tune - e.g. its own early-abort check's
     measure_accuracy() call - not just from the post-fine-tune measurement;
     both are treated identically by this protocol.)
@@ -1123,10 +1134,15 @@ def find_optimal_epsilon_smart(
                               model, so no separate value is needed for that.
         baseline_size:        Original model size in MB.
         baseline_latency_ms:  Original model latency ms.  Measured internally
-                              (10 iterations) if None.
+                              (10 iterations) if None; when supplied, it
+                              should come from a measurement comparable to the
+                              per-trial one (same device, same input shape and
+                              dtype) or the latency factor will be skewed.
         tolerance:            Ternary search stops when interval width < this.
         num_trials:           Total evaluation budget.
-        cache_path:           JSON file for crash-recovery cache.
+        cache_path:           JSON file for crash-recovery cache.  Delete it
+                              whenever scoring inputs change (see the module
+                              docstring's "Cache validity" note).
         min_layer_size:       Skip LRF layers with dim <= this.
         min_rank:             Skip LRF layers when the computed rank is below this.
         skip_large_kernels:   If True, skip Conv2d layers with kernel size > 1×1.
@@ -1140,22 +1156,20 @@ def find_optimal_epsilon_smart(
                               of which HF model it wraps, so guessing from
                               type(model).__name__ can never work here).
         w_accuracy:           CQI legacy accuracy factor weight (default 1.0).
-                              Only used if CQI falls
-                              back to the legacy path (it won't here, since
-                              accuracy_drop_threshold is always passed through).
+                              Only used if CQI falls back to the legacy path
+                              (it won't here, since accuracy_drop_threshold is
+                              always passed through).
         w_size:               CQI size factor weight (default 1.0).
-        w_latency:            CQI latency factor weight (default 1.0, no effect
-                              during search since latency is not measured).
+        w_latency:            CQI latency factor weight (default 1.0).
         accuracy_drop_threshold: Max allowed accuracy drop (pp) for final
-                              selection.  ALSO the pp value early_abort_threshold
-                              scales, AND passed straight through as
+                              selection.  Also passed straight through as
                               CQI's own accuracy_drop_threshold (see above).
         dataloader:           Training/calibration DataLoader for the optional
                               per-trial fine-tune.  None (default) = no
                               fine-tuning regardless of search_ft_epochs.
         num_classes:          Output class count for the optional fine-tune.
         search_ft_epochs:     KD recovery epochs PER TRIAL.  0 (default) =
-                              old behaviour - no fine-tune, fastest search.
+                              no fine-tune, fastest search.
         search_ft_lr:         Learning rate for the optional per-trial fine-tune.
         early_abort_threshold: Direct pp value - "abort a trial's fine-tune
                               after epoch 1 if its drop exceeds this many
@@ -1169,7 +1183,8 @@ def find_optimal_epsilon_smart(
 
     Returns:
         (optimal_epsilon, all_results_dict, search_history)
-          optimal_epsilon   : Best ε (float) or None if CQI < 0.5 or nothing succeeded.
+          optimal_epsilon   : Best ε (float) or None if the best score is
+                              below 1.0 or nothing succeeded.
           all_results_dict  : {str(eps): {epsilon, accuracy, size_mb, latency_ms,
                                score, proxy_score, real_score, phase}}.
                                May contain a 'warning' string key.
@@ -1177,8 +1192,8 @@ def find_optimal_epsilon_smart(
     """
     LATENCY_ITERS = 10
     # Dynamic anchors: n_anchors evenly spaced across (0, 1.0].
-    # Formula: i/(n_anchors+1) for i in 1..n_anchors+1 (last = 1.0 excluded).
-    # Avoids hardcoding 0.1 as the floor - search can now explore < 0.1.
+    # Formula: i/(n_anchors+1) for i in 1..n_anchors (1.0 excluded).
+    # The search can explore below 0.1 - there is no hardcoded floor.
     _n_eps_anchors = 5
     ANCHORS = [round(i / (_n_eps_anchors + 1), 4) for i in range(1, _n_eps_anchors + 1)]
     # e.g. n=5 → [0.1667, 0.333, 0.5, 0.667, 0.833]
@@ -1190,26 +1205,19 @@ def find_optimal_epsilon_smart(
     if baseline_latency_ms is None:
         print("  [ε-search] Measuring baseline latency (10 iterations)...")
         try:
-            # BUGFIX: this used to guess NLP-ness from the model's own class
-            # name ('bert' in str(type(model).__name__).lower()...), but
-            # every registry NLP model is wrapped in NLPClassifierWrapper -
-            # type(model).__name__ is ALWAYS 'NLPClassifierWrapper', never
-            # containing 'bert'/'roberta' - so that check never once fired.
-            # Combined with input_shape still defaulting to the vision shape
-            # (1,3,224,224), a 4D float tensor got forced through the NLP
-            # model's forward pass, crashing deep inside it (typically a
-            # `batch_size, seq_length = input_ids.size()`-style unpack
-            # against a 4-tuple). Silently caught below and reported as a
-            # fake 1.0ms fallback. Now uses the real, caller-supplied
-            # input_shape/input_dtype (the registry's actual values, when
-            # the caller passes them - see run_compression_pipeline).
+            # Uses the caller-supplied input_shape/input_dtype (the
+            # registry's real values when the caller passes them - see
+            # run_compression_pipeline). Guessing NLP-ness from the model's
+            # class name cannot work: every registry NLP model is wrapped in
+            # NLPClassifierWrapper, so type(model).__name__ is always
+            # 'NLPClassifierWrapper'.
             _lat = measure_latency(model, input_shape, device,
                                    num_iterations=LATENCY_ITERS, warmup=3, input_dtype=input_dtype)
             baseline_latency_ms = _lat['mean_ms']
             print(f"  [ε-search] Baseline latency measured: {baseline_latency_ms:.2f} ms")
         except Exception as e:
             print(f"  [ε-search] ⚠️  Latency measurement failed: {e}")
-            print(f"  [ε-search] Falling back to 1.0 ms (this disables latency-based ranking)")
+            print(f"  [ε-search] Falling back to 1.0 ms (this makes every trial's latency ratio meaningless)")
             baseline_latency_ms = 1.0
     print(f"  [ε-search] Baseline: {baseline_accuracy:.2f}%  "
           f"{baseline_size:.2f} MB  {baseline_latency_ms:.2f} ms")
@@ -1259,6 +1267,7 @@ def find_optimal_epsilon_smart(
                 eval_model, test_loader, eval_device, anchor,
                 baseline_accuracy, baseline_size, eval_bl_lat,
                 min_layer_size, cache, input_shape, LATENCY_ITERS,
+                input_dtype=input_dtype,
                 w_accuracy=w_accuracy, w_size=w_size, w_latency=w_latency,
                 min_rank=min_rank, skip_large_kernels=skip_large_kernels,
                 dataloader=dataloader, num_classes=num_classes,
@@ -1361,6 +1370,7 @@ def find_optimal_epsilon_smart(
                     eval_model, test_loader, eval_device, eps,
                     baseline_accuracy, baseline_size, eval_bl_lat,
                     min_layer_size, cache, input_shape, LATENCY_ITERS,
+                    input_dtype=input_dtype,
                     w_accuracy=w_accuracy, w_size=w_size, w_latency=w_latency,
                     min_rank=min_rank, skip_large_kernels=skip_large_kernels,
                     dataloader=dataloader, num_classes=num_classes,
@@ -1443,8 +1453,10 @@ def find_optimal_epsilon_smart(
     if winner['score'] < 1.0:
         accuracy_drop = baseline_accuracy - winner['accuracy']
         warning_msg = (
-            f"Best ε={optimal_epsilon_value:.4f} scores {winner['score']:.3f} < 1.0. "
-            f"Accuracy drop: {accuracy_drop:.2f}%. "
+            f"Best ε={optimal_epsilon_value:.4f} scores {winner['score']:.3f} < 1.0 "
+            f"(accuracy drop {accuracy_drop:.2f}pp, size {winner['size_mb']:.2f} MB vs "
+            f"{baseline_size:.2f} MB, latency {winner['latency_ms']:.2f} ms vs "
+            f"{baseline_latency_ms:.2f} ms). "
             f"LRF makes this model worse overall - skipping LRF."
         )
         optimal_epsilon = None
@@ -1457,6 +1469,7 @@ def find_optimal_epsilon_smart(
             model, test_loader, device, optimal_epsilon,
             baseline_accuracy, baseline_size, baseline_latency_ms,
             min_layer_size, {}, input_shape, LATENCY_ITERS,
+            input_dtype=input_dtype,
             w_accuracy=w_accuracy, w_size=w_size, w_latency=w_latency,
             min_rank=min_rank, skip_large_kernels=skip_large_kernels,
             dataloader=dataloader, num_classes=num_classes,
@@ -1544,30 +1557,28 @@ def find_optimal_pruning_params(
       model_type, num_classes, num_calibration_batches, round_to, isomorphic.
 
     CQI weights adjust which factor most influences the ranking:
-      w_accuracy=2, w_size=1 → accuracy twice as important as compression
-        (only takes effect if CQI falls back to its
-        legacy path - see below, this search always passes
-        accuracy_drop_threshold through, so the barrier accuracy factor is
-        used instead and w_accuracy has no effect here)
       w_kl=3 → search strongly avoids configs with high KL (behavioural drift)
-      w_latency is accepted for API consistency but latency is not measured
-      during search (scores are neutral on that axis).
+      w_latency → every trial measures latency (10 timed iterations against a
+        baseline measured the same way), so a config that shrinks the model
+        but slows it down scores below one that does not; a larger
+        w_latency makes that penalty steeper.
+      w_accuracy has no effect here: this search always passes
+        accuracy_drop_threshold through, so CQI uses the barrier accuracy
+        factor instead of the legacy ratio.
 
-    Accuracy-drop gating now applies to EVERY phase, not just Phase 1's
+    Accuracy-drop gating applies to EVERY phase, not just Phase 1's
     anchor selection.  Phase 1b (ternary ratio refinement), Phase 2
     (max_pruning_ratio grid), and Phase 3 (iterative_steps comparison) all
     use the same strict → relaxed(+10pp) → score-only tier fallback via
-    _select_best_by_tier().  Phase 4 no longer just validates a single
-    funnel winner - it pools EVERY evaluation from the entire search,
-    filters to those within accuracy_drop_threshold, and picks the
+    _select_best_by_tier().  Phase 4 pools EVERY evaluation from the entire
+    search, filters to those within accuracy_drop_threshold, and picks the
     highest-scoring survivor (mirroring find_optimal_epsilon_smart's
-    Phase 3).  This means a low-ratio anchor with a small accuracy drop can
+    Phase 3).  A low-ratio anchor with a small accuracy drop can therefore
     win outright over a high-ratio anchor with a higher raw CQI score but a
-    catastrophic accuracy drop - raw score alone no longer overrides the
-    accuracy gate at the final step. This is now doubly true with the
-    barrier accuracy factor (see CQI's docstring):
-    once a candidate's own drop reaches its accuracy_drop_threshold, its
-    score falls away unboundedly on its own, independent of this tiering.
+    catastrophic accuracy drop. The barrier accuracy factor (see CQI's
+    docstring) reinforces this: once a candidate's own drop reaches its
+    accuracy_drop_threshold, its score falls away unboundedly on its own,
+    independent of this tiering.
 
     Structural-failure abort: shares the same 2-consecutive-failure
     protocol as find_optimal_epsilon_smart.  The counter is shared across
@@ -1601,9 +1612,15 @@ def find_optimal_pruning_params(
         device:                 'cuda' or 'cpu'.
         baseline_accuracy:      Original model accuracy %.
         baseline_size:          Original model size in MB.
-        baseline_latency_ms:    Original model latency ms (measured if None).
+        baseline_latency_ms:    Original model latency ms (measured with 10
+                                iterations if None; when supplied, it should
+                                come from a measurement comparable to the
+                                per-trial one - same device, input shape,
+                                and dtype).
         num_trials:             Total evaluation budget.
-        cache_path:             JSON crash-recovery cache file.
+        cache_path:             JSON crash-recovery cache file.  Delete it
+                                whenever scoring inputs change (see the module
+                                docstring's "Cache validity" note).
         model_type:             Pruning safety clamping type (not searched).
         num_classes:            Output class count for fine-tune metric.
         num_calibration_batches: Activation collection batches (full pipeline).
@@ -1618,21 +1635,16 @@ def find_optimal_pruning_params(
                                 docstring for the detection mechanism.
         round_to:               Round channel counts to this multiple.
         isomorphic:              Force isomorphic pruning across groups.
-        input_shape:            Dummy input for latency measurement.
+        input_shape:            Dummy input shape for latency measurement.
+        input_dtype:            Dummy input dtype for latency measurement.
         w_accuracy:             CQI legacy accuracy factor weight (default 1.0).
-                                Only takes effect if CQI
-                                falls back to its legacy path - this search
-                                always passes accuracy_drop_threshold through,
-                                so in practice the barrier factor is used and
-                                this has no effect.
+                                No effect here - see above.
         w_size:                 CQI size factor weight (default 1.0).
-        w_latency:              CQI latency factor weight (not active during search).
+        w_latency:              CQI latency factor weight (default 1.0).
         w_kl:                   CQI KL divergence penalty weight (default 1.0).
         accuracy_drop_threshold: Max allowed accuracy drop (pp), applied at
-                                 every phase and the final selection. Also the
-                                 pp value early_abort_threshold scales, and
-                                 passed straight through as
-                                 CQI's own
+                                 every phase and the final selection. Also
+                                 passed straight through as CQI's own
                                  accuracy_drop_threshold.
         search_ft_epochs:       Fine-tune epochs per trial during search
                                  (controllable from main.py).
@@ -1644,7 +1656,7 @@ def find_optimal_pruning_params(
                                  accuracy_drop_threshold. None (default) =
                                  disabled - every trial's fine-tune runs all
                                  search_ft_epochs regardless of how bad
-                                 epoch 1 looks (old behaviour).
+                                 epoch 1 looks.
 
     Returns:
         (optimal_params, all_results_dict, search_history)
@@ -1678,19 +1690,15 @@ def find_optimal_pruning_params(
     if baseline_latency_ms is None:
         print("  [prune-search] Measuring baseline latency (10 iterations)...")
         try:
-            # Same bug as the epsilon search had: this used to always use the
-            # vision-default input_shape with no dtype override at all, so an
-            # NLP model would silently crash and fall back to a fake 1.0ms
-            # with NO error printed (unlike epsilon search's version, which
-            # at least logged the failure). Now uses the real caller-supplied
-            # input_shape/input_dtype and reports failures out loud.
+            # Uses the caller-supplied input_shape/input_dtype so NLP models
+            # get real token-ID inputs instead of a vision-shaped tensor.
             _lat = measure_latency(model, input_shape, device,
                                    num_iterations=LATENCY_ITERS, warmup=3, input_dtype=input_dtype)
             baseline_latency_ms = _lat['mean_ms']
             print(f"  [prune-search] Baseline latency measured: {baseline_latency_ms:.2f} ms")
         except Exception as e:
             print(f"  [prune-search] ⚠️  Latency measurement failed: {e}")
-            print(f"  [prune-search] Falling back to 1.0 ms (this disables latency-based ranking)")
+            print(f"  [prune-search] Falling back to 1.0 ms (this makes every trial's latency ratio meaningless)")
             baseline_latency_ms = 1.0
     print(f"  [prune-search] Baseline: {baseline_accuracy:.2f}%  "
           f"{baseline_size:.2f} MB  {baseline_latency_ms:.2f} ms")
@@ -1738,7 +1746,8 @@ def find_optimal_pruning_params(
         Shared eval helper - always runs on real float32 model on device (CUDA).
         max_ratio is a variable parameter so Phase 2 can explore different caps.
         Uses SEARCH_CAL_BATCHES (10) not num_calibration_batches (50) - 5× faster.
-        Skips latency measurement (latency_iters=0 means use baseline_latency_ms).
+        Measures latency with LATENCY_ITERS timed passes so the score reflects
+        speed as well as size and accuracy.
 
         Returns None when the search has already aborted, or when this trial
         itself is the 2nd consecutive structural failure (which also sets the
@@ -1764,7 +1773,7 @@ def find_optimal_pruning_params(
                 round_to=round_to, isomorphic=isomorphic,
                 input_shape=input_shape,
                 input_dtype=input_dtype,
-                latency_iters=0,   # skip latency during search - saves 13 fwd passes/trial
+                latency_iters=LATENCY_ITERS,
                 w_accuracy=w_accuracy, w_size=w_size,
                 w_latency=w_latency, w_kl=w_kl,
                 accuracy_drop_threshold=accuracy_drop_threshold,
@@ -1846,12 +1855,9 @@ def find_optimal_pruning_params(
     anchor_acc_map    = {r: result['accuracy'] for r, result in anchor_results}
 
     def _anchor_acc_drop(a: float) -> float:
-        # BUGFIX: previously looked up `cache.get(str(round(a,4)), {})`, which
-        # mis-keyed against _evaluate_pruning_config's actual compound cache
-        # key ("ratio|max_ratio|epochs|lr|steps") and ALWAYS missed, silently
-        # falling back to "0.0pp drop" for every anchor regardless of its real
-        # accuracy.  Now reads directly from this search's own in-memory
-        # anchor_acc_map, built from the exact results just computed above.
+        # Reads from this search's own in-memory anchor_acc_map. The disk
+        # cache's keys are compound strings ("ratio|max_ratio|epochs|lr|steps"),
+        # so a lookup by str(round(ratio, 4)) alone would never match.
         return baseline_accuracy - anchor_acc_map.get(a, baseline_accuracy)
 
     print("  " + "─" * 72)
@@ -1902,17 +1908,15 @@ def find_optimal_pruning_params(
 
     # ── Phase 1b: Ratio Ternary Refinement ───────────────────────────────────
     # Early exit: if every anchor pruned 0 layers, the architecture has no
-    # prunable Conv2d groups (e.g. transformers). Further search is noise.
-    # (Reads layers_pruned_count, which _evaluate_pruning_config now actually
-    # populates - previously this checked a key that was never written, so
-    # the comparison was always False for any populated entry.)
+    # prunable groups (Torch-Pruning found nothing to remove), so further
+    # search is noise. Reads layers_pruned_count from each anchor's result.
     _all_pruned_zero = all(
         result.get('layers_pruned_count', -1) == 0
         for _, result in anchor_results
     )
     if _all_pruned_zero:
         print(f"  ⚠️  All anchors pruned 0 layers - Torch-Pruning found no prunable "
-              f"Conv2d groups in this architecture (e.g. transformer). "
+              f"groups in this architecture. "
               f"Skipping remaining search phases.")
         all_results = {k: dict(v) for k, v in cache.items() if isinstance(v, dict)}
         return None, all_results, history
@@ -1954,10 +1958,10 @@ def find_optimal_pruning_params(
         )
         history.extend(ternary_hist)
 
-        # Find best ratio across all ratio-phase evaluations - now gated by
-        # accuracy tier, not pure score-max (bug #5: ternary refinement used
-        # to climb purely toward the highest-CQI region even when that region
-        # was the most accuracy-destructive one).
+        # Best ratio across all ratio-phase evaluations, gated by accuracy
+        # tier rather than pure score-max, so refinement cannot climb toward
+        # the highest-CQI region when that region is the most
+        # accuracy-destructive one.
         ratio_phase_entries = [
             v for v in cache.values()
             if isinstance(v, dict)
@@ -1999,6 +2003,7 @@ def find_optimal_pruning_params(
             max_ratio_results[mr] = result
             kl_str = f"  KL={result['kl_divergence']:.3f}" if result.get('kl_divergence') is not None else ""
             print(f"  max_ratio={mr:.2f}  acc={result['accuracy']:.1f}%  "
+                  f"lat={result['latency_ms']:.1f} ms  "
                   f"score={result['score']:.3f}{kl_str}")
             history.append({
                 'phase': 'max_ratio_grid',
@@ -2013,8 +2018,7 @@ def find_optimal_pruning_params(
         print("  [prune-search] Phase 2 skipped - search already aborted.\n")
 
     if max_ratio_results:
-        # Select by accuracy-gated tier, then score (bug #5 fix - previously
-        # pure score-max regardless of accuracy).
+        # Select by accuracy-gated tier, then score.
         _mr_best = _select_best_by_tier(list(max_ratio_results.values()), baseline_accuracy, accuracy_drop_threshold)
         best_max_ratio = next(mr for mr, r in max_ratio_results.items() if r is _mr_best) \
                          if _mr_best is not None else max_pruning_ratio
@@ -2065,17 +2069,13 @@ def find_optimal_pruning_params(
         best_iter_steps = 1
 
     # ── Phase 4: Final Selection (pool ENTIRE cache, filter, pick best) ───────
-    # Completely rewritten (bug #5): previously this only re-validated the
-    # single funnel winner from Phases 1-3 with a binary accept/reject and NO
-    # fallback - meaning a config sitting in the cache the whole time with a
-    # small, acceptable accuracy drop (e.g. a low ratio anchor) could never
-    # win if the funnel happened to walk toward a different, accuracy-
-    # destroying region (which is exactly what CQI_W_SIZE > CQI_W_ACCURACY
-    # tends to do).  Now mirrors find_optimal_epsilon_smart's Phase 3 exactly:
-    # pool every cached evaluation, filter to the ones within
-    # accuracy_drop_threshold, and pick the highest score among survivors -
+    # Pools every cached evaluation, filters to the ones within
+    # accuracy_drop_threshold, and picks the highest score among survivors,
     # falling back to "best available regardless of threshold" only if the
-    # survivor pool is empty.
+    # survivor pool is empty. This mirrors find_optimal_epsilon_smart's
+    # Phase 3, so a config with a small, acceptable accuracy drop can win
+    # over one with a higher raw score but a catastrophic drop, even if the
+    # earlier phases walked toward a different region.
     print(f"{'=' * 70}")
     print("PRUNING SEARCH - PHASE 4: FINAL SELECTION")
     print(f"{'=' * 70}\n")
@@ -2098,12 +2098,12 @@ def find_optimal_pruning_params(
     candidates_sorted = sorted(candidates, key=lambda v: v['score'], reverse=True)
     winner = candidates_sorted[0]
 
-    print(f"  {'Rank':>4}  {'Ratio':>8}  {'MaxR':>6}  {'Steps':>5}  {'Accuracy':>9}  {'Size':>8}  {'Score':>8}")
-    print(f"  {'-' * 60}")
+    print(f"  {'Rank':>4}  {'Ratio':>8}  {'MaxR':>6}  {'Steps':>5}  {'Accuracy':>9}  {'Size':>8}  {'Latency':>9}  {'Score':>8}")
+    print(f"  {'-' * 72}")
     for rank, v in enumerate(candidates_sorted[:5], start=1):
         print(f"  #{rank:>3}   {v['pruning_ratio']:.4f}  {v.get('max_pruning_ratio',0):.2f}   "
               f"{v.get('iterative_steps',1):>5}  {v['accuracy']:>7.2f}%  "
-              f"{v['size_mb']:>6.2f} MB  {v['score']:>8.3f}")
+              f"{v['size_mb']:>6.2f} MB  {v['latency_ms']:>7.1f} ms  {v['score']:>8.3f}")
     print()
 
     warning_msg: Optional[str]    = None
@@ -2112,7 +2112,9 @@ def find_optimal_pruning_params(
 
     if winner['score'] < 1.0:
         warning_msg = (f"Best config (ratio={winner['pruning_ratio']:.4f}) scores "
-                        f"{winner['score']:.3f} < 1.0 - pruning makes this model "
+                        f"{winner['score']:.3f} < 1.0 (size {winner['size_mb']:.2f} MB vs "
+                        f"{baseline_size:.2f} MB, latency {winner['latency_ms']:.2f} ms vs "
+                        f"{baseline_latency_ms:.2f} ms) - pruning makes this model "
                         f"worse overall. Skipping pruning.")
         print(f"  ❌  {warning_msg}\n")
     elif acc_drop_final > accuracy_drop_threshold and _tier_used != "strict":

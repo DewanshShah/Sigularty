@@ -211,6 +211,10 @@ different models get separate cache files automatically. Pass an
 explicit path yourself for a stronger guarantee (e.g. distinct caches per
 dataset too, not just per model/class-count).
 
+Cached scores don't record which CQI weights or latency settings produced them.
+Delete the cache files (`.sigularty_cache/` by default) after changing any
+`cqi_w_*` argument, or old scores will be mixed with new ones.
+
 If you have `.sigularty_cache/` files from before `test_loader` existed,
 delete them. Those cached accuracy numbers were measured against
 `dataloader` (effectively training data, since `compress()` had no other
@@ -305,6 +309,15 @@ than finding them frozen.
 Each is an exponent applied to that factor's ratio in the Compression
 Quality Index: raise one to make the search/report weight that factor
 more heavily.
+
+Both hyperparameter searches (`find_optimal_epsilon` and
+`find_optimal_pruning`) measure latency on every trial, so `cqi_w_latency`
+affects which epsilon or pruning config wins, not just the final report. A
+technique that shrinks the model but makes it slower is scored accordingly;
+raise `cqi_w_latency` to make the searches stricter about speed. Latency is a
+ratio like size, so a large size reduction can still outweigh a moderate
+slowdown. The per-technique accuracy gate is unaffected: it only checks
+accuracy, and no technique is reverted for being slower.
 
 | Arg | Default |
 |---|---|
