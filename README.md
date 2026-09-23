@@ -14,7 +14,7 @@ For installation and learning the "sigularty" package refer to it's [Pypi page](
 
 Here are compression results on some models (The results are achieved by the algorithm itself, no human fine-tuning was involved): 
 
-Constants used for each one (Better results can be achieved by using a better learning rate): `batch_size = 16, train_sample = 3000, pretrain_lr = 0.0001, accuracy_drop_threshold = 10`
+Constants used for each one (Better results can be achieved by using a better learning rate): `batch_size = 16, train_sample = 3000, accuracy_drop_threshold = 10`
 
 | Model | Acc Drop | Compression Ratio | CQI | Speedup | Size (MB) | Accuracy (%) | Latency (ms) |
 | :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: |
@@ -23,6 +23,7 @@ Constants used for each one (Better results can be achieved by using a better le
 | `efficientnet_b0` | **2.80%** | **2.61x** | **2.284**| **0.90x** | 15.95 -> 6.11 | 91.80 -> 89.00 | 8.238 -> 9.124|
 | `bert_base` | **4.20%** | **6.61x** | **6.449** | **1.02x** | 417.66 -> 67.17 | 86.20 -> 82.00 | 10.393 -> 10.209 |
 | `distilbert` | **5.60%** | **9.55x** | **7.049** | **0.78x** | 255.42 -> 26.75 | 82.40 -> 76.80 | 5.441 -> 6.957 |
+| `distilgpt2` | **0.00%** | **2.00x** | **2.903** | **1.45x** | 312.48 -> 156.24 | 87.20 -> 87.20 | 8.559 -> 5.896 |
 
 ---
 
