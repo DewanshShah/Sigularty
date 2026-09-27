@@ -11,8 +11,9 @@ you already know what pruning, quantization, distillation, BN fusion, etc. are.
 
 For installation and learning the "sigularty" package refer to it's [PyPI page](https://pypi.org/project/sigularty/)
 
-Compression results on some models (achieved by the algorithm itself, no humanfine-tuning involved). 
-Constants used: `train_sample = 3000, accuracy_drop_threshold = 10`
+Here are compression results on some models (The results are achieved by the algorithm itself, no human fine-tuning was involved): 
+
+Constants used for each one (Better results can be achieved by using a better learning rate): `train_sample = 3000, accuracy_drop_threshold = 10`
 
 | Model | Acc Drop | Compression Ratio | CQI | Speedup | Size (MB) | Accuracy (%) | Latency (ms) |
 | :--- | ---: | ---: | ---: | :---: | :---: | :---: | :---: |

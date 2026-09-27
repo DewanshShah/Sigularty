@@ -496,7 +496,7 @@ SUPPORTED_MODELS: dict = {
             'use_quantization':      True,
             'lrf_skip_large_kernels': True,
             'pretrain_epochs':       25,
-            'pretrain_lr':           0.01,
+            'pretrain_lr':           0.0001,
         },
     },
 
