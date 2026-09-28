@@ -104,7 +104,7 @@ result.compressed_accuracy
 result.original_latency_ms
 result.compressed_latency_ms
 result.latency_speedup         # original_lat / compressed_lat, >1.0 = faster
-result.cqi                     # Compression Quality Index: see README.md
+result.cqi                     # Compression Quality Index, >1.0 = better tradeoff than the original; can be negative — see "CQI scoring" below
 result.techniques_applied      # list[str], only techniques that actually ran/survived their accuracy gate — see "Accuracy-drop gating" below
 result.report_path             # path to the saved PNG report, or None
 result.pruning_report          # dict of per-layer pruning detail, or None (also None if pruning ran but was reverted by the gate)
@@ -169,13 +169,13 @@ runs before `test_loader` is resolved via auto-split — pretrain trains on
 
 | Arg | Default | What it does |
 |---|---|---|
-| `find_optimal_epsilon` | `False` | Auto-search for the best LRF epsilon instead of using `lrf_epsilon` as-is. |
-| `find_optimal_pruning` | `False` | Auto-search for the best pruning ratio instead of using `pruning_ratio` as-is. |
+| `find_optimal_epsilon` | `False` | Auto-search for the best LRF epsilon instead of using `lrf_epsilon` as-is. If the best candidate scores below `1.0` CQI (worse than not compressing), or every candidate exceeds `accuracy_drop_threshold`, LRF is disabled for the run rather than falling back to `lrf_epsilon`. |
+| `find_optimal_pruning` | `False` | Auto-search for the best pruning ratio instead of using `pruning_ratio` as-is. Same rule: no viable configuration disables pruning for the run. |
 | `epsilon_search_trials` | `15` | Evaluation budget for the epsilon search. |
 | `pruning_search_trials` | `16` | Evaluation budget for the pruning search. |
 | `pruning_search_ft_epochs` | `1` | Fine-tune epochs per trial during the pruning search (kept low for speed: the real run uses `pruning_fine_tune_epochs`). |
 | `pruning_search_ft_lr` | `1e-4` | Fine-tune learning rate per trial during the pruning search. |
-| `accuracy_drop_threshold` | `5.0` | Max acceptable accuracy drop in percentage points: used by both searches' final selection AND the pipeline's per-technique revert gate. |
+| `accuracy_drop_threshold` | `5.0` | Max acceptable accuracy drop in percentage points. Used three ways: both searches' final selection, the pipeline's per-technique revert gate, and the budget the CQI accuracy factor is normalized against (see "CQI scoring" below). |
 | `early_abort_threshold` | `None` | Direct pp value (not a multiplier on `accuracy_drop_threshold`). After epoch 1 of Pruning's or LRF's own recovery fine-tune — in both the real pipeline and their searches — abort the remaining epochs if the drop vs. the original baseline already exceeds this. `None` (default) = disabled; every fine-tune always runs to completion. |
 | `epsilon_cache_path` | `None` | Override the auto-derived per-model cache file for the epsilon search. `None` = `.sigularty_cache/epsilon_<model>.json`. |
 | `pruning_cache_path` | `None` | Override the auto-derived per-model cache file for the pruning search. `None` = `.sigularty_cache/pruning_<model>.json`. |
@@ -211,9 +211,13 @@ different models get separate cache files automatically. Pass an
 explicit path yourself for a stronger guarantee (e.g. distinct caches per
 dataset too, not just per model/class-count).
 
-Cached scores don't record which CQI weights or latency settings produced them.
-Delete the cache files (`.sigularty_cache/` by default) after changing any
-`cqi_w_*` argument, or old scores will be mixed with new ones.
+Cached scores don't record which CQI weights, CQI accuracy formula, or
+latency settings produced them. Delete the cache files
+(`.sigularty_cache/` by default) after changing any `cqi_w_*` argument,
+after changing `accuracy_drop_threshold` (it now shapes every cached
+score, not just the final selection), or after upgrading from a release
+whose CQI used the plain accuracy ratio — those cached scores sit on a
+different scale and would be mixed with current ones under the same keys.
 
 If you have `.sigularty_cache/` files from before `test_loader` existed,
 delete them. Those cached accuracy numbers were measured against
@@ -304,27 +308,79 @@ than finding them frozen.
 | `gptq_cal_batches` | `16` | Batches used to estimate the Hessian from activations. |
 | `gptq_block_size` | `128` | Columns processed per Hessian update block. |
 
-### CQI scoring weights
+### CQI scoring
 
-Each is an exponent applied to that factor's ratio in the Compression
-Quality Index: raise one to make the search/report weight that factor
-more heavily.
+The Compression Quality Index combines accuracy, size, latency, and
+(for pruning) output-distribution drift into one number. Both
+hyperparameter searches rank every trial by it, and it's the `cqi`
+value on `CompressionResult` and in the report.
 
-Both hyperparameter searches (`find_optimal_epsilon` and
-`find_optimal_pruning`) measure latency on every trial, so `cqi_w_latency`
-affects which epsilon or pruning config wins, not just the final report. A
-technique that shrinks the model but makes it slower is scored accordingly;
-raise `cqi_w_latency` to make the searches stricter about speed. Latency is a
-ratio like size, so a large size reduction can still outweigh a moderate
-slowdown. The per-technique accuracy gate is unaffected: it only checks
-accuracy, and no technique is reverted for being slower.
+```
+CQI = accuracy_factor
+    × (baseline_size / size)^cqi_w_size
+    × (baseline_latency / latency)^cqi_w_latency
+    × (1 / (1 + KL))^cqi_w_kl                       [pruning only]
+```
 
-| Arg | Default |
+**Reading it:** `1.0` means no better than the original model; `2.5`
+means the combined accuracy/size/speed tradeoff is 2.5x better.
+
+**The accuracy factor** is a function of the accuracy drop measured
+against `accuracy_drop_threshold`. Let `x = drop / accuracy_drop_threshold`,
+where `drop = original_accuracy - compressed_accuracy` in percentage
+points. `x = 1` means the drop exactly equals the budget, the same point
+at which the pipeline's own gate would revert a technique.
+
+| Region | Factor | Behavior |
+|---|---|---|
+| `x < 0` (accuracy improved) | `1 + (2 - 1) · t / (1 + t)`, `t = -x` | Saturating reward, capped at `2.0`. Improving accuracy earns a bounded bonus, never an unlimited one. |
+| `0 ≤ x < 1` (within budget) | `1 - 0.1 · x` | Gentle straight-line decline. Using the entire budget costs at most `0.1`, so a small drop barely changes the ranking. |
+| `x ≥ 1` (at or past budget) | `1.9 - exp(25 · (x - 1))` | Continuous with the region above at `x = 1`, then falls away unboundedly and steeply. |
+
+The three pieces join continuously, so there are no gaps or jumps in the
+score. Worked example at `accuracy_drop_threshold=10`:
+
+| Accuracy drop | Factor |
 |---|---|
-| `cqi_w_accuracy` | `1.0` |
-| `cqi_w_size` | `1.0` |
-| `cqi_w_latency` | `1.0` |
-| `cqi_w_kl` | `1.0` (only meaningful when pruning ran) |
+| -11 pp | ≈ 1.524 |
+| -1 pp | ≈ 1.091 |
+| 0 pp | 1.000 |
+| 1 pp | 0.990 |
+| 5 pp | 0.950 |
+| 10 pp | 0.900 |
+| 11 pp | ≈ -10.28 |
+
+The point of the last piece is that a size or latency ratio can't buy
+back an accuracy drop at or past your budget: the factor falls faster
+than any compression ratio can grow. Because of that, **CQI can be
+negative**, and a negative value is meaningful: the accuracy loss alone
+already makes that configuration worse than doing nothing, regardless of
+how small or fast the model got. The searches treat any winner scoring
+below `1.0` as non-viable and disable that technique for the run.
+
+`accuracy_drop_threshold` is what drives all of this. `compress()`
+always passes it through, so every trial score inside both searches and
+the final `result.cqi` use this accuracy factor. Its shape constants
+(the `2.0` reward ceiling, `0.1` in-budget slope, and `25` post-budget
+steepness) are fixed defaults and not exposed as `compress()` arguments;
+the one knob you control is the threshold itself.
+
+The size, latency, and KL factors are plain ratios raised to their
+weight. Both searches measure latency on every trial, so `cqi_w_latency`
+affects which epsilon or pruning config wins, not just the final report.
+A technique that shrinks the model but makes it slower is scored
+accordingly; raise `cqi_w_latency` to make the searches stricter about
+speed. Latency is a ratio like size, so a large size reduction can still
+outweigh a moderate slowdown. The per-technique accuracy gate is
+unaffected by these weights: it only checks accuracy, and no technique is
+reverted for being slower.
+
+| Arg | Default | What it does |
+|---|---|---|
+| `cqi_w_accuracy` | `1.0` | No effect inside `compress()`. Since `accuracy_drop_threshold` is always passed, CQI uses the accuracy factor above instead of the plain `(accuracy / baseline_accuracy)` ratio this weight used to scale. Kept so existing calls don't break. |
+| `cqi_w_size` | `1.0` | Exponent on the size ratio. Raise to favor smaller models. |
+| `cqi_w_latency` | `1.0` | Exponent on the latency ratio. Raise to favor faster models. |
+| `cqi_w_kl` | `1.0` | Exponent on the KL-divergence penalty. Only meaningful when pruning ran. |
 
 ### Report
 
