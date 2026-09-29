@@ -345,6 +345,20 @@ def main() -> dict:
     """
     args = parse_args()
 
+    # ── Explicit-CLI capture for pretrain_epochs / pretrain_lr ─────────────────
+    # Captured here, before anything below can overwrite them, so the registry
+    # block further down can tell "the user explicitly passed --pretrain-epochs
+    # / --pretrain-lr" apart from "this fell through to argparse's own default."
+    # This is what gives an explicit CLI flag priority over a registry
+    # recommendation — the same precedence _api.py's load_from_registry() uses
+    # (it compares against the function's own parameter default; this compares
+    # against argparse's own flag default, the direct equivalent here). Same
+    # known limitation as load_from_registry()'s: an explicit flag value that
+    # happens to equal argparse's own default (10 / 0.001) is indistinguishable
+    # from "not passed" and will still be treated as overridable by the registry.
+    _pretrain_epochs_explicit = (args.pretrain_epochs != 10)
+    _pretrain_lr_explicit     = (args.pretrain_lr     != 0.001)
+
     # ── Boolean / flag constants ──────────────────────────────────────────────
     # The OR pattern lets CLI --flag enable a technique even when the constant
     # is False.  When the constant is False AND no CLI flag was passed, the
@@ -456,11 +470,14 @@ def main() -> dict:
     # the model metadata.  Keep it as a fallback for legacy EfficientNet flow.
     args.num_classes = NUM_CLASSES
 
-    # ── Registry metadata — override pretrain_epochs and pretrain_lr only ───────
+    # ── Registry metadata — can supply pretrain_epochs and pretrain_lr only ─────
     # main.py hyperparameters take precedence for all OTHER settings.
-    # Registry recommendations override ONLY pretrain_epochs and pretrain_lr.
+    # Registry recommendations can supply ONLY pretrain_epochs and pretrain_lr,
+    # and even then only when no explicit --pretrain-epochs / --pretrain-lr CLI
+    # flag was passed: an explicit flag always wins over the registry.
     # This ensures your USE_PRUNING, USE_CLUSTERING, etc. constants always work as expected,
-    # while allowing the model registry to guide dataset-specific training hyperparameters.
+    # while allowing the model registry to guide dataset-specific training hyperparameters
+    # whenever you haven't told it otherwise.
     # (LRF is a special case: nn.MultiheadAttention architectures get
     # use_low_rank / find_optimal_epsilon force-disabled at RUNTIME inside
     # run_compression_pipeline, regardless of this file's constants — see the
@@ -491,16 +508,25 @@ def main() -> dict:
                     print(f"    lrf_skip_large_kernels = {_rec['lrf_skip_large_kernels']}"
                           f"  (main.py: {args.lrf_skip_large_kernels})")
                 
-                # Registry overrides ONLY pretrain_epochs and pretrain_lr.
+                # Registry can supply pretrain_epochs and pretrain_lr, but an
+                # explicit CLI flag always wins over the registry recommendation,
+                # which in turn wins over main.py's own PRETRAIN_EPOCHS /
+                # PRETRAIN_LR constants — see the explicit-CLI capture right
+                # after parse_args() above.
                 # All technique flags (use_pruning, use_low_rank, etc.) are controlled
                 # exclusively by main.py constants — the registry never overrides them.
-                if _rec.get('pretrain_epochs'):
+                if _rec.get('pretrain_epochs') and not _pretrain_epochs_explicit:
                     print(f"    Recommended pretrain_epochs: {_rec['pretrain_epochs']}  (main.py: {args.pretrain_epochs})")
                     args.pretrain_epochs = _rec['pretrain_epochs']
-                if _rec.get('pretrain_lr'):
+                elif _rec.get('pretrain_epochs'):
+                    print(f"    Recommended pretrain_epochs: {_rec['pretrain_epochs']}  (CLI flag takes priority: keeping {args.pretrain_epochs})")
+                if _rec.get('pretrain_lr') and not _pretrain_lr_explicit:
                     print(f"    Recommended pretrain_lr: {_rec['pretrain_lr']}  (main.py: {args.pretrain_lr})")
                     args.pretrain_lr = _rec['pretrain_lr']
-                print(f"  [Registry] Using registry values for pretrain_epochs & pretrain_lr; main.py constants for all others.")
+                elif _rec.get('pretrain_lr'):
+                    print(f"    Recommended pretrain_lr: {_rec['pretrain_lr']}  (CLI flag takes priority: keeping {args.pretrain_lr})")
+                print(f"  [Registry] pretrain_epochs & pretrain_lr precedence: CLI flag > registry recommendation > main.py constants.")
+                print(f"  [Registry] All other settings remain main.py-only.")
     except ImportError:
         pass
 

@@ -631,10 +631,13 @@ All models in `model_registry.py`. Use `python main.py --list-models` to print t
 | `albert_base` | ALBERT | sst2 | 11.7M | Shared weights across layers |
 | **`distilgpt2`** | GPT-2 | sst2 | 81.9M | Causal attention, classification |
 
-Registry `recommended` settings override only `pretrain_epochs`/`pretrain_lr` -
-every other setting comes from `main.py`'s constants. The `nn.MultiheadAttention`
-check is a separate runtime check, not part of `recommended` and not overridable
-by it.
+Registry `recommended` settings can supply `pretrain_epochs`/`pretrain_lr` - every
+other setting comes from `main.py`'s constants. For those two, precedence is:
+explicit CLI flag (`--pretrain-epochs`/`--pretrain-lr`) > registry recommendation >
+`main.py`'s own `PRETRAIN_EPOCHS`/`PRETRAIN_LR` constants. A flag value equal to its
+argparse default (`10` epochs / `0.001` lr) can't be told apart from no flag at all,
+so the registry value still applies in that case. The `nn.MultiheadAttention` check
+is a separate runtime check, not part of `recommended` and not overridable by it.
 
 ---
 
@@ -839,6 +842,3 @@ pip install transformers datasets --break-system-packages
 ```
 
 ---
-
-## Contributing
-This project isn't taking external pull requests yet
