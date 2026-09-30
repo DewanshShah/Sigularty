@@ -69,6 +69,8 @@ from sigularty import (
     load_from_registry,     # pull a registry model + its dataset together
     finetune,                # fine-tune a model before compressing it
     find_best_lr,            # LR range test: run before finetune()/pretrain_*
+    export_to_onnx,          # export the compressed model to ONNX
+    run_onnx_inference,      # run + benchmark that .onnx file on ONNX Runtime
     plot_compression_report,
     plot_pruning_report,
     plot_epsilon_landscape,
@@ -81,6 +83,8 @@ from sigularty import (
 | `load_from_registry(model_name, *, device=None, train_sample=None, test_sample=500, batch_size=32, model_path=None, force_retrain=False, pretrain_epochs=10, pretrain_lr=1e-4)` | See list of registry model names below. Sole supported registry entry point. | `RegistryResult` |
 | `finetune(model, train_loader, *, test_loader=None, num_classes=10, epochs=10, lr=1e-3, max_batches=0, device=None, save_path=None)` | Fine-tunes in place and returns the same object. `test_loader` defaults to `train_loader` if omitted — pass a genuine held-out loader if you want the per-epoch `test_acc` it prints to mean anything. | `nn.Module` |
 | `find_best_lr(model, dataloader, *, device=None, num_classes=10, start_lr=1e-7, end_lr=10.0, num_steps=100)` | LR range test; run before `finetune()` or `pretrain_epochs > 0`. | `float` |
+| `export_to_onnx(model, save_path, input_shape=(1,3,224,224), device='cpu', opset_version=17, dynamic_batch=True)` | Exports `model` (typically `result.model`) to a verified `.onnx` file. See [Exporting to ONNX](#exporting-to-onnx) below. | `str` (absolute path to the `.onnx` file) |
+| `run_onnx_inference(onnx_path, dataloader, input_shape=(1,3,224,224), num_latency_iterations=100, warmup=10)` | Loads that `.onnx` file into an ONNX Runtime session and measures real accuracy + latency on it. | `dict` |
 
 Registry model names (pass as `model_name`): `custom_cnn`, `resnet18`,
 `resnet50`, `resnext50_32x4d`, `wide_resnet50_2`, `vgg16`, `densenet121`,
@@ -124,6 +128,60 @@ layer: `name`, `layer_type`, `lrf_epsilon`, `prunable`, `size_kb`), and
 
 `load_from_registry()` returns a `RegistryResult`: `model`, `train_loader`,
 `test_loader`, `num_classes`, `model_name`, `dataset_name`.
+
+---
+
+## Exporting to ONNX
+
+Once you have a compressed model, export it to ONNX to check it actually
+runs cleanly outside PyTorch and to benchmark it on the runtime most
+deployment targets (mobile, edge, serving) actually use.
+
+```python
+from sigularty import compress, export_to_onnx, run_onnx_inference
+
+result = compress(model, train_loader, test_loader=test_loader, num_classes=num_classes)
+
+onnx_path = export_to_onnx(
+    result.model,
+    save_path='compressed_model.onnx',
+    input_shape=(1, 3, 224, 224),   # use the registry's meta['input_shape'] for a registry model
+)
+
+# Run it on ONNX Runtime and measure real accuracy + latency on that engine
+stats = run_onnx_inference(onnx_path, test_loader)
+print(stats)
+# {'accuracy_pct': 88.4, 'mean_latency_ms': 3.21, 'median_latency_ms': 3.05,
+#  'p95_latency_ms': 3.9, 'p99_latency_ms': 4.6, 'onnx_path': '/abs/path/compressed_model.onnx'}
+```
+
+`export_to_onnx()` moves the model to `device` (`'cpu'` is recommended —
+CUDA exports need a CUDA-capable export machine, and most ONNX Runtime
+deployment targets are CPU anyway), traces it with a single dummy input of
+`input_shape`, and runs `onnx.checker.check_model()` on the result before
+returning the absolute path. Requires `pip install onnx`.
+
+**Dynamic INT8 (`quant_mode='dynamic'`) does not export.** Its `qint8`
+custom ops aren't traceable by `torch.onnx.export`, and this is a real,
+raised `RuntimeError` with a remediation message, not a silently-broken
+file. If you need an ONNX export, use `quant_mode='fp16'` or
+`quant_mode='static'` instead (both export cleanly), or export the model
+*before* dynamic quantization would have run.
+
+**`input_shape` must match what the model actually expects.** For a
+registry NLP model this is a token-ID shape like `(1, 128)`, not the
+vision default `(1, 3, 224, 224)` — pull it from
+`meta['input_shape']`/`meta['input_dtype']` (see `get_model_meta()` in
+`model_registry.py`) rather than guessing.
+
+`run_onnx_inference()` loads the exported file into an
+`onnxruntime.InferenceSession` (CPU execution provider), measures top-1
+accuracy over the full `dataloader` you pass it — use your held-out
+`test_loader` for a real, generalization-reflecting number — then times
+`num_latency_iterations` dummy forward passes (after `warmup` untimed
+passes). Requires `pip install onnxruntime`. Raises `FileNotFoundError` if
+`onnx_path` doesn't exist, and `ImportError` if `onnxruntime` isn't
+installed.
 
 ---
 
@@ -342,7 +400,7 @@ score. Worked example at `accuracy_drop_threshold=10`:
 
 | Accuracy drop | Factor |
 |---|---|
-| -11 pp | ≈ 1.524 |
+| -11 pp (improved) | ≈ 1.524 |
 | -1 pp | ≈ 1.091 |
 | 0 pp | 1.000 |
 | 1 pp | 0.990 |

@@ -1589,6 +1589,148 @@ def _derive_cache_key(model: nn.Module, num_classes: int) -> str:
     return f"{type(model).__name__}_{n_params}_{num_classes}"
 
 
+
+# ============================================================================
+# ── ONNX EXPORT API ───────────────────────────────────────────────────────────
+# Thin pass-throughs to helper_functions.py's implementations — export and
+# runtime logic itself lives there; this only exposes it at the top-level
+# package surface (`from sigularty import export_to_onnx, run_onnx_inference`)
+# instead of requiring library users to reach into sigularty.helper_functions
+# directly.
+# ============================================================================
+
+def export_to_onnx(
+    model: nn.Module,
+    save_path: str,
+    input_shape: tuple = (1, 3, 224, 224),
+    device: str = "cpu",
+    opset_version: int = 17,
+    dynamic_batch: bool = True,
+) -> str:
+    """
+    Export a PyTorch model (typically `result.model` from compress()) to ONNX
+    format and verify the exported graph with onnx.checker.
+
+    A single random dummy input of `input_shape` traces the model's compute
+    graph. Dynamic INT8-quantized models (quant_mode='dynamic') cannot be
+    exported — their qint8 custom ops aren't traceable by torch.onnx.export —
+    and this raises a RuntimeError with a clear remediation message rather
+    than silently producing a broken file. Export before dynamic quantization
+    runs, or use quant_mode='fp16' / 'static' instead, both of which export
+    cleanly.
+
+    Parameters
+    ----------
+    model         : Any nn.Module. Moved to `device` internally and switched
+                    to eval() mode.
+    save_path     : Destination file path, e.g. 'compressed_model.onnx'.
+    input_shape   : Shape of a single input tensor (includes batch dim). Use
+                    the registry's meta['input_shape'] for a registry model
+                    (e.g. (1, 128) for NLP token-ID inputs — the vision
+                    default of (1, 3, 224, 224) will not trace an NLP model).
+    device        : Device for the dummy forward pass during tracing. 'cpu'
+                    is recommended — CUDA exports require a CUDA-capable
+                    machine at export time, and most deployment ONNX Runtime
+                    targets run on CPU anyway.
+    opset_version : ONNX opset version (17 is broadly supported as of 2025).
+    dynamic_batch : If True, marks the batch dimension as dynamic so the
+                    exported graph accepts any batch size at inference time,
+                    not just whatever batch size `input_shape` specified.
+
+    Returns
+    -------
+    str — absolute path to the exported, checker-verified .onnx file.
+
+    Raises
+    ------
+    RuntimeError : The model contains dynamic-INT8 (qint8) ops that torch.onnx
+                   cannot trace, or onnx.checker found errors in the exported
+                   graph.
+    ImportError  : The 'onnx' package is not installed
+                   (`pip install onnx`).
+
+    Example
+    -------
+    >>> from sigularty import compress, export_to_onnx
+    >>> result = compress(model, train_loader, test_loader=test_loader)
+    >>> path = export_to_onnx(result.model, 'compressed_model.onnx')
+    >>> print(path)
+    /abs/path/to/compressed_model.onnx
+    """
+    from sigularty.helper_functions import export_to_onnx as _export_to_onnx
+    return _export_to_onnx(
+        model=model,
+        save_path=save_path,
+        input_shape=input_shape,
+        device=device,
+        opset_version=opset_version,
+        dynamic_batch=dynamic_batch,
+    )
+
+
+def run_onnx_inference(
+    onnx_path: str,
+    dataloader: DataLoader,
+    input_shape: tuple = (1, 3, 224, 224),
+    num_latency_iterations: int = 100,
+    warmup: int = 10,
+) -> dict:
+    """
+    Load an exported .onnx file into an ONNX Runtime session and measure its
+    real accuracy and latency on that runtime — not PyTorch's, the actual
+    engine most deployment targets (mobile, edge, serving) run.
+
+    Runs top-1 accuracy over the full `dataloader` on ONNX Runtime's CPU
+    execution provider, then times `num_latency_iterations` dummy forward
+    passes (after `warmup` untimed warmup passes) to measure per-batch
+    latency.
+
+    Parameters
+    ----------
+    onnx_path              : Path to the .onnx file produced by
+                              export_to_onnx().
+    dataloader              : DataLoader yielding (X, y) float32 CPU batches —
+                              pass your held-out test_loader for a real,
+                              generalization-reflecting accuracy read.
+    input_shape             : Shape of a single dummy input for latency timing
+                              (includes batch dim). Should match what
+                              export_to_onnx() was called with for this model.
+    num_latency_iterations  : Number of timed dummy forward passes.
+    warmup                  : Untimed warmup passes before timing starts.
+
+    Returns
+    -------
+    dict with keys:
+        accuracy_pct       (float) top-1 accuracy on `dataloader`
+        mean_latency_ms    (float) mean per-batch latency
+        median_latency_ms  (float)
+        p95_latency_ms     (float)
+        p99_latency_ms     (float)
+        onnx_path          (str)   absolute path to the model file
+
+    Raises
+    ------
+    ImportError       : The 'onnxruntime' package is not installed
+                         (`pip install onnxruntime`).
+    FileNotFoundError : onnx_path does not exist.
+
+    Example
+    -------
+    >>> from sigularty import export_to_onnx, run_onnx_inference
+    >>> path = export_to_onnx(result.model, 'compressed_model.onnx')
+    >>> stats = run_onnx_inference(path, test_loader)
+    >>> print(f"{stats['accuracy_pct']:.2f}%  {stats['mean_latency_ms']:.3f} ms")
+    """
+    from sigularty.helper_functions import run_onnx_inference as _run_onnx_inference
+    return _run_onnx_inference(
+        onnx_path=onnx_path,
+        dataloader=dataloader,
+        input_shape=input_shape,
+        num_latency_iterations=num_latency_iterations,
+        warmup=warmup,
+    )
+
+
 # ============================================================================
 # ── VISUALIZATION API ─────────────────────────────────────────────────────────
 # All three functions are thin wrappers — they never run models or search

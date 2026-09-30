@@ -9,6 +9,8 @@ Public interface:
     find_best_lr(model, dataloader, **kwargs)    -> float
     analyze(model, dataloader=None, **kwargs)    -> AnalysisResult
     load_from_registry(model_name, **kwargs)     -> RegistryResult
+    export_to_onnx(model, save_path, **kwargs)   -> str (path to .onnx file)
+    run_onnx_inference(onnx_path, dataloader, **kwargs) -> dict
     plot_compression_report(result, model, dl)   -> str (PNG path)
     plot_pruning_report(result)                  -> str or None
     plot_epsilon_landscape(...)                  -> str (PNG path)
@@ -41,6 +43,8 @@ from sigularty._api import (
     finetune,
     find_best_lr,
     load_from_registry,
+    export_to_onnx,
+    run_onnx_inference,
     plot_compression_report,
     plot_pruning_report,
     plot_epsilon_landscape,
@@ -56,6 +60,8 @@ __all__ = [
     "finetune",
     "find_best_lr",
     "load_from_registry",
+    "export_to_onnx",
+    "run_onnx_inference",
     "plot_compression_report",
     "plot_pruning_report",
     "plot_epsilon_landscape",
@@ -65,4 +71,4 @@ __all__ = [
     "RegistryResult",
 ]
 
-__version__ = "1.1.1"
+__version__ = "1.1.3"
