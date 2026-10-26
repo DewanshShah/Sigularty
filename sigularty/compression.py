@@ -15,13 +15,13 @@ Techniques (in pipeline order)
 
 Public API
 ----------
-  apply_bn_fusion(model)                               -> nn.Module        [Tier 1]
-  compute_layer_sensitivity(model, dataloader, ...)    -> dict             [Tier 2A]
-  sensitivity_to_pruning_ratios(sensitivities, ...)    -> dict             [Tier 2A]
-  fine_tune_with_distillation(student, teacher, ...)   -> nn.Module        [Tier 2B]
-  compute_adaptive_epsilons(model, ...)                -> dict             [Tier 3A]
-  apply_adaptive_lrf(model, adaptive_epsilons, ...)    -> nn.Module        [Tier 3A]
-  apply_gptq_quantization(model, dataloader, ...)      -> nn.Module        [Tier 3B]
+  apply_bn_fusion(model)                               -> nn.Module        
+  compute_layer_sensitivity(model, dataloader, ...)    -> dict             
+  sensitivity_to_pruning_ratios(sensitivities, ...)    -> dict             
+  fine_tune_with_distillation(student, teacher, ...)   -> nn.Module        
+  compute_adaptive_epsilons(model, ...)                -> dict             
+  apply_adaptive_lrf(model, adaptive_epsilons, ...)    -> nn.Module        
+  apply_gptq_quantization(model, dataloader, ...)      -> nn.Module        
   apply_structured_pruning(model, dataloader, ...)     -> nn.Module
   apply_low_rank_factorization(model, ...)             -> nn.Module
   apply_weight_clustering(model, dataloader, ...)      -> nn.Module
