@@ -557,7 +557,7 @@ continuously and driven by `ceiling` / `penalty_slope` / `penalty_steepness` -
 replacing the older `acc_ratio ** w_accuracy` term (kept as a fallback for
 legacy callers that don't pass `accuracy_drop_threshold`). The exact per-piece
 formulas need the real `optimization.py` source before this section can state
-them precisely - flagging rather than guessing at the equations.
+them precisely.
 
 Size, latency, and KL factors are unaffected by the above - still plain ratios
 raised to their weight.
