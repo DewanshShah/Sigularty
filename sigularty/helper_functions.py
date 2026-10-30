@@ -1156,8 +1156,16 @@ def train_model(
     Generic training loop for any classification model.
 
     Uses Adam + ReduceLROnPlateau (halves LR when validation accuracy stops
-    improving for 2 epochs).  Saves the best checkpoint to save_path after
-    every improvement if a path is given.
+    improving for 2 epochs).  The epoch with the highest validation accuracy
+    is tracked, and when training finishes the model is restored to that
+    epoch's weights before being returned.  The returned model therefore
+    always matches the best checkpoint: if save_path is given, the file
+    written there holds exactly the same weights the returned model holds.
+
+    The best weights are kept as a CPU copy so tracking them does not add a
+    second model's worth of GPU memory.  The checkpoint on disk is written
+    after every improvement, so a crashed run still leaves the best weights
+    seen so far.
 
     Works with any architecture — just pass the model, loaders, and class
     count.  The model must already have its output head set to num_classes
@@ -1166,7 +1174,7 @@ def train_model(
     Args:
         model:        Any nn.Module with output dim = num_classes.
         train_loader: Training DataLoader.
-        test_loader:  Validation/test DataLoader.
+        test_loader:  Validation/test DataLoader (also used to pick the best epoch).
         num_classes:  Number of output classes (for torchmetrics accuracy).
         epochs:       Number of training epochs.
         lr:           Initial learning rate for Adam.
@@ -1174,7 +1182,8 @@ def train_model(
         save_path:    Optional .pth path; best checkpoint saved here.
 
     Returns:
-        Trained model (same object, returned for chaining).
+        The model (same object, returned for chaining) holding its
+        best-epoch weights.  If epochs <= 0 the model is returned unchanged.
     """
     print(f"\n🏋️  Training for {epochs} epoch(s)  lr={lr}  classes={num_classes}  device={device}")
     model.to(device)
@@ -1186,7 +1195,10 @@ def train_model(
     loss_fn     = nn.CrossEntropyLoss()
     accuracy_fn = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes).to(device)
 
-    best_acc = 0.0
+    best_acc   = 0.0
+    best_epoch = 0
+    best_state: Optional[dict] = None
+
     for epoch in tqdm(range(epochs), desc="Training"):
         tr_loss, tr_acc = _one_train_epoch(
             model, train_loader, optimizer, loss_fn, accuracy_fn, device,
@@ -1202,7 +1214,13 @@ def train_model(
         )
 
         if te_acc > best_acc:
-            best_acc = te_acc
+            best_acc   = te_acc
+            best_epoch = epoch + 1
+            # CPU copy: detach + clone so later optimizer steps cannot
+            # mutate the snapshot in place.
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
             if save_path:
                 os.makedirs(
                     os.path.dirname(save_path) if os.path.dirname(save_path) else '.',
@@ -1211,10 +1229,16 @@ def train_model(
                 torch.save(model.state_dict(), save_path)
                 print(f"    ✓ Checkpoint saved ({best_acc * 100:.2f}%)")
 
-    print(f"\n✅ Training done. Best test accuracy: {best_acc * 100:.2f}%")
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        model.to(device)
+        print(f"\n✅ Training done. Restored best epoch ({best_epoch}/{epochs}): "
+              f"test accuracy {best_acc * 100:.2f}%")
+    else:
+        print("\n✅ Training done (no epochs run).")
+
+    model.eval()
     return model
-
-
 
 # ============================================================================
 # DATA + MODEL LOADING

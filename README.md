@@ -597,6 +597,14 @@ PRETRAIN_EPOCHS = 10       # only used when no checkpoint exists
 PRETRAIN_LR     = 0.001
 FORCE_RETRAIN   = False
 
+#`train_model` evaluates on the test set after every epoch and restores the
+#best-scoring epoch's weights before returning, so the model returned by
+#`load_from_registry()` / `load_or_train_from_registry()` always matches the
+#checkpoint on disk, and `compress()`'s baseline accuracy is the same whether
+#the model was just trained or loaded from a checkpoint. Note the best epoch
+#is selected on the same test set later used for the baseline and every
+#accuracy gate, so that baseline is a max over epochs and slightly optimistic.
+
 EXPORT_ONNX = False
 RUN_ONNX    = False
 ONNX_OPSET  = 17

@@ -499,7 +499,7 @@ def _validate_proxy_correlation(
     Validate that proxy efficiency score rank order matches the real model.
 
     With 2 anchor configurations, rank order (which config scores higher) is
-    a clear binary check.  Pearson correlation requires more points and is
+    a clear Ternary check.  Pearson correlation requires more points and is
     unstable at this sample size.
 
     Each callable in `correlation_eval_fns` accepts (model, device) and
@@ -1062,7 +1062,7 @@ def find_optimal_epsilon_smart(
     early_abort_threshold: Optional[float] = None,
 ) -> Tuple[Optional[float], dict, list]:
     """
-    Two-phase LRF epsilon search: anchor sampling + binary search refinement.
+    Two-phase LRF epsilon search: anchor sampling + Ternary search refinement.
 
     accuracy_drop_threshold: max allowed accuracy drop (pp). Anchor for refinement
     uses threshold+10pp; final selection uses strict threshold. Also passed
@@ -1335,10 +1335,10 @@ def find_optimal_epsilon_smart(
     if refine_anchor in (_succeeded_anchors[0], _succeeded_anchors[-1]):
         print(f"  ⚠  Refine anchor at boundary ε={refine_anchor:.2f}.\n")
 
-    # ── Phase 2: Binary Search Refinement (skipped if Phase 1 aborted) ───────
+    # ── Phase 2: Ternary Search Refinement (skipped if Phase 1 aborted) ───────
     if not _failure_state['aborted'] and max_iter > 0:
         print(f"{'=' * 70}")
-        print("EPSILON SEARCH - PHASE 2: BINARY SEARCH REFINEMENT")
+        print("EPSILON SEARCH - PHASE 2: TERNARY SEARCH REFINEMENT")
         print(f"{'=' * 70}")
 
         best_idx = _succeeded_anchors.index(refine_anchor)
@@ -1938,7 +1938,7 @@ def find_optimal_pruning_params(
             r_low  = _succeeded_ratios[best_idx - 1]
             r_high = _succeeded_ratios[best_idx + 1]
 
-        print(f"  Binary search in [{r_low:.3f}, {r_high:.3f}]  budget={ratio_max_iter} evals\n")
+        print(f"  Ternary search in [{r_low:.3f}, {r_high:.3f}]  budget={ratio_max_iter} evals\n")
 
         def _ratio_score_fn(ratio: float) -> Tuple[Optional[float], Optional[dict]]:
             result = _run_eval(ratio, 1)
