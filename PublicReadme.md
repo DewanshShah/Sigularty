@@ -120,6 +120,14 @@ Every accuracy value on this object — `original_accuracy`,
 decision along the way) — is measured against `test_loader`, never
 against `dataloader`.
 
+Latency is measured on the model `compress()` actually returns (after GPTQ,
+quantization, and KD), on the device that model runs on, with the same iteration
+and warmup settings used for the original, so `latency_speedup` and the latency
+factor in `cqi` describe the returned model rather than an intermediate one.
+Dynamic INT8 (`quant_mode='dynamic'`) has no CUDA kernel and runs on CPU; in that
+case the original is timed on CPU too, and both `original_latency_ms` and
+`compressed_latency_ms` are CPU numbers.
+
 `analyze()` returns an `AnalysisResult`: `size_mb`, `num_parameters`,
 `architecture_type` (`'cnn'` / `'transformer'` / `'hybrid'` / `'unknown'`),
 `recommended_techniques`, `per_layer_signals` (a `LayerSignal` per eligible

@@ -98,7 +98,11 @@ GPTQ, Quantization, and the final KD step are gated separately in
 after the float32 stages for latency comparisons to stay fair.
 
 All final metrics (accuracy, size, latency) are measured on the actually-deployed
-compressed model, never an intermediate one.
+compressed model, never an intermediate one. `python main.py` times the final model on
+the device it actually runs on. `compress()` does the same, and also times the original
+with identical iteration/warmup settings on that same device: for fp16 and GPTQ that is
+the main compute device; for dynamic INT8 (CPU-only) the original is re-timed on CPU, so
+`latency_speedup` and `cqi` compare CPU against CPU.
 
 ---
 

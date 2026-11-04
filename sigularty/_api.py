@@ -79,8 +79,12 @@ class CompressionResult:
     size_compressed_mb  Compressed model size in MB.
     original_accuracy   Original model top-1 accuracy % on test_loader.
     compressed_accuracy Compressed model top-1 accuracy % on test_loader.
-    original_latency_ms Mean inference latency (ms) of original model.
-    compressed_latency_ms Mean inference latency (ms) of compressed model.
+    original_latency_ms Mean inference latency (ms) of the original model,
+                        timed on the same device the final compressed model
+                        runs on.
+    compressed_latency_ms Mean inference latency (ms) of the final compressed
+                        model (after GPTQ, quantization, and KD), on the
+                        device it actually runs on.
     latency_speedup     original_lat / compressed_lat. >1.0 = faster.
     cqi                 Compression Quality Index (accuracy × size × latency).
     techniques_applied  List of technique names in pipeline order. Only
@@ -404,9 +408,13 @@ def compress(
     so the model is never fine-tuned and then graded on the exact same
     samples. See _auto_split_dataloader's docstring for the mechanics.
 
-    Latency is always measured in float32 on the target device so GPU-vs-GPU
-    comparisons are fair.  Accuracy and size use the final compressed model,
-    which may be INT8/fp16.
+    Accuracy, size, and latency are all measured on the final compressed
+    model — after GPTQ, quantization, and KD — on the device it actually runs
+    on, with the same iteration and warmup settings the baseline used.  GPTQ
+    and fp16 stay on the main compute device.  Dynamic INT8 has no CUDA
+    kernel and runs on CPU, so in that case the original model is timed on
+    CPU as well, and original_latency_ms, compressed_latency_ms,
+    latency_speedup, and cqi all compare CPU against CPU.
 
     Accuracy-drop gating is always active: Structured Pruning, Low-Rank
     Factorization, and Weight Clustering, and GPTQ, standard Quantization,
@@ -453,16 +461,16 @@ def compress(
 
     CQI accuracy factor (all cqi_w_* args and the final result.cqi): every
     compression_quality_index() call this function makes — the compressed
-    model's final CQI, and every trial score inside the two searches — now
-    passes accuracy_drop_threshold straight through, which is what opts them
-    into the new three-piece barrier accuracy factor (see
-    optimization.py's compression_quality_index docstring) instead of the
-    legacy (accuracy/baseline_accuracy)**cqi_w_accuracy ratio. This is the
-    fix for the original defect that motivated the barrier factor: an
-    unbounded size/latency ratio can no longer buy back an accuracy drop
+    model's final CQI, and every trial score inside the two searches —
+    passes accuracy_drop_threshold straight through, which selects the
+    three-piece barrier accuracy factor (see optimization.py's
+    compression_quality_index docstring) rather than the plain
+    (accuracy/baseline_accuracy)**cqi_w_accuracy ratio. Under the barrier
+    factor, an unbounded size/latency ratio cannot buy back an accuracy drop
     that is at or past accuracy_drop_threshold — the accuracy factor falls
     away unboundedly on its own once a config reaches that point, whatever
-    the compression ratio.
+    the compression ratio.  The latency factor uses the final model's
+    latency (see the note above), not an intermediate stage's.
     """
     # ── Deferred imports ────────────────────────────────
     from sigularty.compression import (
@@ -497,10 +505,9 @@ def compress(
         quant_mode = 'dynamic'
 
     # ── Evaluation data — resolve test_loader before anything touches the
-    #    data, including the optional pre-training step below. If pretrain
-    #    trained on data that later gets called "held out", every downstream
-    #    measurement against that data would be contaminated the same way
-    #    the whole rest of this fix exists to prevent. ─────────────────────────
+    #    data, including the optional pre-training step below, so
+    #    pre-training never trains on data that is later treated as held
+    #    out. ───────────────────────────────────────────────────────────────
     if test_loader is None:
         dataloader, test_loader = _auto_split_dataloader(dataloader)
 
@@ -621,11 +628,12 @@ def compress(
             use_pruning = False
 
     # ── Structural compression (float32) ───────────────────────────────────────
-    # BN Fusion, Pruning, LRF, Clustering. Quantization is deferred:
-    # quantized tensors (qint8) have no CUDA kernel, which would make GPU
-    # latency comparisons unfair. KD fine-tuning is also deferred so it runs
-    # exactly once, after quantization/GPTQ, and can recover accuracy lost
-    # to all of them at once rather than just to the structural changes.
+    # BN Fusion, Pruning, LRF, Clustering. Quantization is deferred: SVD and
+    # k-means need float32 weights, and dynamic INT8 (qint8) has no CUDA
+    # kernel, so it moves the model to CPU. KD fine-tuning is also deferred
+    # so it runs exactly once, after quantization/GPTQ, and can recover
+    # accuracy lost to all of them at once rather than just to the
+    # structural changes.
     print("\n[compress] Structural compression...")
     compressed_pre_quant = apply_compression_pipeline(
         model=model,
@@ -679,12 +687,6 @@ def compress(
         input_shape=input_shape,
         input_dtype=input_dtype,
     )
-
-    # Latency measured on float32 model — GPU vs GPU, apples-to-apples
-    comp_latency = measure_latency(
-        compressed_pre_quant, input_shape, device, num_iterations=50, warmup=5,
-        input_dtype=input_dtype,
-    )['mean_ms']
 
     # current_accuracy is threaded through the entire rest of this function —
     # every gate below reads/updates it, mirroring run_compression_pipeline()'s
@@ -1008,9 +1010,33 @@ def compress(
     # current_accuracy already reflects the correctly-measured, final state
     # from whichever gate/re-measurement above touched it last — reusing it
     # here avoids a redundant measure_accuracy() call for an identical number.
+    # Latency has no such running value: it is timed here, once, on the model
+    # that is actually returned (post-GPTQ/quantization/KD, post-fp16 recast),
+    # on the device that model lives on, with the same iteration and warmup
+    # settings the baseline used so the two numbers are directly comparable.
     print(f"\n[compress] Evaluating compressed model (on {acc_device})...")
     comp_acc  = current_accuracy
     comp_size = get_model_size_mb(compressed_model)
+
+    if acc_device == device:
+        original_latency = baseline_latency
+    else:
+        # The final model lives on a different device than the one the
+        # baseline was timed on (dynamic INT8 is CPU-only). A GPU baseline
+        # against a CPU result is not a meaningful speedup, so a copy of the
+        # original is timed on the final model's device instead. A copy,
+        # because measure_latency moves the model it is given.
+        print(f"  Final model runs on {acc_device}, baseline was timed on "
+              f"{device} — timing the original on {acc_device} so both "
+              f"latencies share a device...")
+        original_latency = measure_latency(
+            copy.deepcopy(model), input_shape, acc_device,
+            num_iterations=50, warmup=5, input_dtype=input_dtype,
+        )['mean_ms']
+    comp_latency = measure_latency(
+        compressed_model, input_shape, acc_device,
+        num_iterations=50, warmup=5, input_dtype=input_dtype,
+    )['mean_ms']
 
     # ── What actually survived gating ─────────────────────────────────────────
     # A technique that got reverted by its own accuracy gate must not be
@@ -1039,17 +1065,18 @@ def compress(
         techniques.append(f'KD Fine-tune (T={kd_temperature:.1f}, α={kd_alpha:.2f})')
 
     # ── CQI ───────────────────────────────────────────────────────────────────
-    # accuracy_drop_threshold is passed straight through here too — this is
-    # what makes the FINAL, headline CQI displayed on CompressionResult use
-    # the new barrier accuracy factor rather than the legacy ratio, exactly
-    # like every trial score inside the two searches above already does.
+    # accuracy_drop_threshold is passed straight through here too, so the
+    # headline CQI on CompressionResult uses the barrier accuracy factor, the
+    # same as every trial score inside the two searches above. The latency
+    # factor compares the final model against the original on the same
+    # device.
     cqi = compression_quality_index(
         accuracy=comp_acc,
         size_mb=comp_size,
         baseline_accuracy=baseline_acc,
         baseline_size=baseline_size,
         latency_ms=comp_latency,
-        baseline_latency_ms=baseline_latency,
+        baseline_latency_ms=original_latency,
         accuracy_drop_threshold=accuracy_drop_threshold,
         w_accuracy=cqi_w_accuracy,
         w_size=cqi_w_size,
@@ -1067,7 +1094,7 @@ def compress(
                 'compressed_size_mb':    comp_size,
                 'original_params':       count_parameters(model),
                 'compressed_params':     count_parameters(compressed_model),
-                'original_latency_ms':   baseline_latency,
+                'original_latency_ms':   original_latency,
                 'compressed_latency_ms': comp_latency,
                 'techniques_used':       techniques,
                 'cqi':                   cqi,
@@ -1087,17 +1114,15 @@ def compress(
             print(f"  ⚠️  Report generation failed: {exc}")
 
     # ── Derived scalars ───────────────────────────────────────────────────────
-    lat_speedup   = (baseline_latency / comp_latency) if comp_latency > 0 else 1.0
+    lat_speedup   = (original_latency / comp_latency) if comp_latency > 0 else 1.0
     acc_retention = (comp_acc / baseline_acc * 100)   if baseline_acc  > 0 else 0.0
     comp_ratio    = (baseline_size / comp_size)        if comp_size     > 0 else 1.0
 
     print(f"\n[compress] Done.")
     print(f"  Ratio       : {comp_ratio:.2f}×")
-    print(f"  Accuracy    : {baseline_acc:.2f}% → {comp_acc:.2f}%  "
-          f"(retention {acc_retention:.1f}%)")
+    print(f"  Accuracy    : {baseline_acc:.2f}% → {comp_acc:.2f}% (retention {acc_retention:.1f}%)")
     print(f"  Size        : {baseline_size:.2f} MB → {comp_size:.2f} MB")
-    print(f"  Latency     : {baseline_latency:.3f} ms → {comp_latency:.3f} ms  "
-          f"({lat_speedup:.2f}× speedup)")
+    print(f"  Latency     : {original_latency:.3f} ms → {comp_latency:.3f} ms ({lat_speedup:.2f}× speedup)")
     print(f"  CQI         : {cqi:.3f}")
 
     return CompressionResult(
@@ -1108,7 +1133,7 @@ def compress(
         size_compressed_mb=comp_size,
         original_accuracy=baseline_acc,
         compressed_accuracy=comp_acc,
-        original_latency_ms=baseline_latency,
+        original_latency_ms=original_latency,
         compressed_latency_ms=comp_latency,
         latency_speedup=lat_speedup,
         cqi=cqi,
@@ -1678,7 +1703,7 @@ def run_onnx_inference(
     """
     Load an exported .onnx file into an ONNX Runtime session and measure its
     real accuracy and latency on that runtime — not PyTorch's, the actual
-    engine most deployment targets (mobile, edge, serving) run.
+    engine most deployment targets (mobile, edge, serving) run on.
 
     Runs top-1 accuracy over the full `dataloader` on ONNX Runtime's CPU
     execution provider, then times `num_latency_iterations` dummy forward
@@ -1768,8 +1793,8 @@ def plot_compression_report(
     device          : Device for metric fallback computation. Auto-detected.
     accuracy_drop_threshold: The accuracy_drop_threshold you passed to
                       compress() for this result, if you want the CQI shown
-                      here (should it need recomputing) to use the new
-                      barrier accuracy factor rather than the legacy ratio.
+                      here (should it need recomputing) to use the barrier
+                      accuracy factor rather than the legacy ratio.
                       Not required — result.cqi is already attached to
                       metrics_dict below and generate_compression_report()
                       only falls back to recomputing CQI when it's missing,
