@@ -74,6 +74,7 @@ from sigularty import (
     plot_compression_report,
     plot_pruning_report,
     plot_epsilon_landscape,
+    plot_pruning_search,
 )
 ```
 
@@ -105,13 +106,15 @@ result.size_original_mb
 result.size_compressed_mb
 result.original_accuracy
 result.compressed_accuracy
-result.original_latency_ms
-result.compressed_latency_ms
-result.latency_speedup         # original_lat / compressed_lat, >1.0 = faster
+result.original_latency_ms     # timed on the device result.model runs on (see below)
+result.compressed_latency_ms   # latency of result.model itself; nan if it could not be timed
+result.latency_speedup         # original_lat / compressed_lat, >1.0 = faster; nan if not timed
 result.cqi                     # Compression Quality Index, >1.0 = better tradeoff than the original; can be negative — see "CQI scoring" below
 result.techniques_applied      # list[str], only techniques that actually ran/survived their accuracy gate — see "Accuracy-drop gating" below
 result.report_path             # path to the saved PNG report, or None
 result.pruning_report          # dict of per-layer pruning detail, or None (also None if pruning ran but was reverted by the gate)
+result.epsilon_landscape_path  # saved epsilon-search graph, or None — see "Search graphs" below
+result.pruning_search_path     # saved pruning-search graph, or None — see "Search graphs" below
 ```
 
 Every accuracy value on this object — `original_accuracy`,
@@ -120,13 +123,41 @@ Every accuracy value on this object — `original_accuracy`,
 decision along the way) — is measured against `test_loader`, never
 against `dataloader`.
 
-Latency is measured on the model `compress()` actually returns (after GPTQ,
-quantization, and KD), on the device that model runs on, with the same iteration
-and warmup settings used for the original, so `latency_speedup` and the latency
-factor in `cqi` describe the returned model rather than an intermediate one.
-Dynamic INT8 (`quant_mode='dynamic'`) has no CUDA kernel and runs on CPU; in that
-case the original is timed on CPU too, and both `original_latency_ms` and
-`compressed_latency_ms` are CPU numbers.
+Every latency value is measured on the model `result.model` actually is, not
+on an intermediate stage: `original_latency_ms`, `compressed_latency_ms`,
+`latency_speedup`, and the latency factor inside `cqi` all describe the
+final model — timed after GPTQ, quantization, KD and the final fp16 cast, on
+the device it runs on, in its own dtype. Dynamic INT8 only runs on CPU, so
+with `quant_mode='dynamic'` the original is re-timed on CPU as well (on a
+throwaway copy; your model is never moved) and `original_latency_ms` is that
+CPU number — the two latencies and the speedup always compare like with
+like. If timing the final model fails, `compress()` still returns the model:
+`compressed_latency_ms` and `latency_speedup` are `nan`, `cqi` is computed
+without its latency factor, and a warning prints.
+
+Releases up to and including 1.1.3 timed an intermediate float32 model (the
+one before GPTQ, quantization and KD) instead, so their `latency_speedup`,
+`compressed_latency_ms` and `cqi` did not describe `result.model` — re-run
+`compress()` to get real numbers.
+
+**Search graphs.** When `find_optimal_epsilon` or `find_optimal_pruning` runs and
+`save_report=True`, `compress()` saves that search's graph right after the search
+finishes and returns its absolute path:
+
+- `result.epsilon_landscape_path` — CQI vs epsilon with the optimum marked,
+  accuracy and size across the anchors, the ternary refinement path, and the top
+  candidates.
+- `result.pruning_search_path` — CQI vs pruning ratio, accuracy and size vs ratio
+  (accuracy budget shaded), the max-ratio grid, and the top candidates.
+
+A trial whose CQI is far below zero (the accuracy barrier falls away
+exponentially past the budget — `-1e8`, `-1e40`, ...) would flatten the rest of
+the plot, so it is pinned to the bottom of the axis, drawn as a red-edged
+triangle, and its true CQI is in the legend. Either path is `None` if that search
+didn't run, `save_report=False`, or there was nothing to plot; a rendering
+failure only prints a warning. Pick the file names with `epsilon_landscape_path=`
+and `pruning_search_path=`, or re-render from your own search results with
+`plot_epsilon_landscape(...)` / `plot_pruning_search(...)`.
 
 `analyze()` returns an `AnalysisResult`: `size_mb`, `num_parameters`,
 `architecture_type` (`'cnn'` / `'transformer'` / `'hybrid'` / `'unknown'`),
@@ -245,6 +276,9 @@ runs before `test_loader` is resolved via auto-split — pretrain trains on
 | `early_abort_threshold` | `None` | Direct pp value (not a multiplier on `accuracy_drop_threshold`). After epoch 1 of Pruning's or LRF's own recovery fine-tune — in both the real pipeline and their searches — abort the remaining epochs if the drop vs. the original baseline already exceeds this. `None` (default) = disabled; every fine-tune always runs to completion. |
 | `epsilon_cache_path` | `None` | Override the auto-derived per-model cache file for the epsilon search. `None` = `.sigularty_cache/epsilon_<model>.json`. |
 | `pruning_cache_path` | `None` | Override the auto-derived per-model cache file for the pruning search. `None` = `.sigularty_cache/pruning_<model>.json`. |
+
+When a search runs, its graph is saved too — see "Search graphs" under *What
+`compress()` returns*.
 
 **Accuracy-drop gating is always active.** Structured Pruning, Low-Rank
 Factorization, Weight Clustering, GPTQ, standard Quantization, and the
@@ -439,7 +473,8 @@ accordingly; raise `cqi_w_latency` to make the searches stricter about
 speed. Latency is a ratio like size, so a large size reduction can still
 outweigh a moderate slowdown. The per-technique accuracy gate is
 unaffected by these weights: it only checks accuracy, and no technique is
-reverted for being slower.
+reverted for being slower. The final `result.cqi` uses the latency of
+`result.model` itself, timed as described under "What `compress()` returns".
 
 | Arg | Default | What it does |
 |---|---|---|
@@ -452,5 +487,7 @@ reverted for being slower.
 
 | Arg | Default | What it does |
 |---|---|---|
-| `save_report` | `True` | Generate the PNG compression report. |
-| `report_path` | `'compression_report.png'` | Where to save it. |
+| `save_report` | `True` | Generate the PNG compression report, and the search graphs when a search runs. |
+| `report_path` | `'compression_report.png'` | Where to save the compression report. |
+| `epsilon_landscape_path` | `'epsilon_landscape.png'` | Where to save the epsilon-search graph (only when `find_optimal_epsilon=True` ran and `save_report=True`). |
+| `pruning_search_path` | `'pruning_search.png'` | Where to save the pruning-search graph (only when `find_optimal_pruning=True` ran and `save_report=True`). |

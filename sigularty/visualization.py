@@ -9,6 +9,8 @@ Public API
                                metrics_dict, save_path)    -> dict
   plot_epsilon_landscape(results, search_history,
                          optimal_epsilon, ...)             -> None
+  plot_pruning_search(results, search_history,
+                      optimal_params, ...)                 -> None
   plot_pruning_report(pruning_report, save_path)           -> None
 
 Design rules:
@@ -21,7 +23,7 @@ Design rules:
   - No global state, no hidden side-effects.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from scipy.interpolate import CubicSpline   # only scipy import in this file
 # Use GridSpec with height_ratios
@@ -58,6 +60,75 @@ def _fmt(value, fmt: str = ".2f", suffix: str = "") -> str:
     if value is None:
         return "N/A"
     return f"{value:{fmt}}{suffix}"
+
+
+class _ScoreClip(NamedTuple):
+    """Axis limits and pin level chosen by _score_clip."""
+    axis_lo: float   # lower axis limit (a little below the floor)
+    axis_hi: float   # upper axis limit
+    floor:   float   # scores below this are off-scale and get pinned here
+
+    @property
+    def limits(self):
+        return self.axis_lo, self.axis_hi
+
+
+def _score_clip(scores, floor_frac: float = 0.35):
+    """
+    Decide whether CQI-like scores need an off-scale floor, and where it sits.
+
+    CQI past the accuracy-drop budget falls away exponentially (see
+    _accuracy_barrier_factor in optimization.py), so one over-compressed trial
+    can score -1e8 — or -1e40 — and flatten every other point on a linear
+    axis.  A log-type axis would not help: it would spend nearly all of its
+    height on a range nobody can act on.  Instead the useful range stays
+    linear; anything below the floor is pinned to the floor (see
+    _pin_scores) and flagged with its true value (see _mark_off_scale).
+
+    Returns None when every score is inside the normal range (plot as usual),
+    else a _ScoreClip: the axis limits to apply and the floor to pin to.
+    """
+    finite = [float(s) for s in scores if s is not None and np.isfinite(s)]
+    if not finite:
+        return None
+    top   = max(max(finite), 1.0)
+    floor = -floor_frac * top
+    if min(finite) >= floor:
+        return None
+    axis_hi = top * 1.15
+    # Axis bottom sits a little below the floor so pinned markers are not
+    # half-cut by the frame.
+    return _ScoreClip(floor - 0.10 * (axis_hi - floor), axis_hi, floor)
+
+
+def _pin_scores(scores, clip):
+    """Scores with off-scale ones pinned to the floor, plus one off-scale flag per score."""
+    if clip is None:
+        return list(scores), [False] * len(scores)
+    lo = clip.floor
+    return [max(s, lo) for s in scores], [s < lo for s in scores]
+
+
+def _fmt_score(value: float) -> str:
+    """3 decimals normally; scientific notation once the number gets absurd (-1e74 etc.)."""
+    return f"{value:.3f}" if abs(value) < 1e4 else f"{value:.2e}"
+
+
+def _mark_off_scale(ax, xs, shown, scores, off, face) -> None:
+    """
+    Overlay red-edged triangles on the points that were pinned to the axis
+    floor.  The legend entry carries their true CQI range.
+    """
+    idx = [i for i, o in enumerate(off) if o]
+    if not idx:
+        return
+    true = [scores[i] for i in idx]
+    rng  = (_fmt_score(true[0]) if len(true) == 1
+            else f"{_fmt_score(min(true))} … {_fmt_score(max(true))}")
+    ax.scatter([xs[i] for i in idx], [shown[i] for i in idx],
+               marker='v', s=170, color=face, edgecolors='#e74c3c',
+               linewidths=2, zorder=7,
+               label=f'Off-scale ×{len(idx)} (true CQI {rng})')
 
 
 def _bar_pair(
@@ -215,7 +286,7 @@ def plot_epsilon_landscape(
     Panels:
       1 (top-left)    — CQI Landscape: anchor points + cubic spline.
       2 (top-right)   — Anchor Points Accuracy vs Size: dual-axis line chart.
-      3 (bottom-left) — Binary Search Path: spline background + evaluated points.
+      3 (bottom-left) — Ternary Search Path: spline background + evaluated points.
       4 (bottom-right)— Top 3 Candidates: horizontal bar chart.
 
     Args:
@@ -229,7 +300,7 @@ def plot_epsilon_landscape(
         save_path:         Destination file path for the PNG.
     """
 
-    # ── Extract anchor and binary search data ──────────────────────────────────
+    # ── Extract anchor and ternary-refinement data ─────────────────────────────
     # Filter out the optional 'warning' key and any non-dict entries
     valid_results: List[Tuple[float, dict]] = [
         (float(k), v)
@@ -248,8 +319,13 @@ def plot_epsilon_landscape(
     anchor_accs   = [r['accuracy'] for _, r in anchor_entries]
     anchor_sizes  = [r['size_mb']  for _, r in anchor_entries]
 
-    binary_evals = [
-        entry for entry in search_history if entry.get('phase') == 'binary'
+    # The refinement phase of find_optimal_epsilon_smart is a TERNARY search
+    # (_ternary_search labels its history entries 'ternary'). This used to
+    # filter on 'binary', which never matched, so panel 3 always claimed the
+    # search had converged on the anchors. 'binary' is still accepted so
+    # histories saved before the switch keep plotting.
+    ternary_evals = [
+        entry for entry in search_history if entry.get('phase') in ('ternary', 'binary')
     ]
 
     # Top-3 candidates ranked by score descending
@@ -269,11 +345,19 @@ def plot_epsilon_landscape(
             if abs(all_ranked[0][0] - optimal_epsilon) > 1e-5:
                 tie_broken = True   # optimal is NOT the highest-score entry
 
+    # One over-compressed anchor can score -1e8 or far lower (see _score_clip).
+    # The cubic spline is skipped then: interpolating across a cliff of that
+    # size is meaningless and rings wildly.
+    _opt_entry  = (results.get(str(round(optimal_epsilon, 4)), {})
+                   if optimal_epsilon is not None else {})
+    _opt_scores = [_opt_entry['score']] if 'score' in _opt_entry else []
+    anchor_clip = _score_clip(anchor_scores + _opt_scores)
+
     # ── Build cubic spline through anchor points ──────────────────────────────
     spline        = None
     x_spline      = None
     y_spline      = None
-    if len(anchor_eps) >= 4:
+    if len(anchor_eps) >= 4 and anchor_clip is None:
         try:
             spline   = CubicSpline(anchor_eps, anchor_scores)
             x_spline = np.linspace(min(anchor_eps), max(anchor_eps), 300)
@@ -315,16 +399,19 @@ def plot_epsilon_landscape(
     ax1.axhline(1.0, color='grey', linestyle='--', linewidth=1.5, alpha=0.7,
                 label='No improvement (CQI=1.0)')
 
-    # Anchor scatter points
-    ax1.scatter(anchor_eps, anchor_scores,
+    # Anchor scatter points.  Anchors whose CQI is below the axis floor are
+    # pinned to it and drawn as red-edged triangles (true value in the legend).
+    shown_scores, off_scale = _pin_scores(anchor_scores, anchor_clip)
+    ax1.scatter(anchor_eps, shown_scores,
                 s=150, color=BLUE, edgecolors='black', zorder=5,
                 label='Anchor points')
+    _mark_off_scale(ax1, anchor_eps, shown_scores, anchor_scores, off_scale, BLUE)
 
     # Annotate each anchor with its epsilon value (above the point)
-    for eps, score in zip(anchor_eps, anchor_scores):
+    for eps, shown in zip(anchor_eps, shown_scores):
         ax1.annotate(
             f'ε={eps:.2f}',
-            xy=(eps, score),
+            xy=(eps, shown),
             xytext=(0, 9),
             textcoords='offset points',
             fontsize=8, color=DARK, ha='center',
@@ -336,10 +423,14 @@ def plot_epsilon_landscape(
         opt_score = results.get(opt_key, {}).get('score', 0.0)
         if opt_score == 0.0 and spline is not None:
             opt_score = float(spline(optimal_epsilon))
+        if anchor_clip is not None:
+            opt_score = max(opt_score, anchor_clip.floor)
         ax1.scatter([optimal_epsilon], [opt_score],
                     marker='*', s=350, color='red', edgecolors='darkred',
                     zorder=10, label=f'Optimal ε={optimal_epsilon:.2f}')
 
+    if anchor_clip is not None:
+        ax1.set_ylim(*anchor_clip.limits)
     ax1.set_xlabel('Epsilon (ε)', fontweight='bold')
     ax1.set_ylabel('CQI (Compression Quality Index)', fontweight='bold')
     ax1.set_title('Compression Quality Index (CQI) Landscape', fontweight='bold', fontsize=12)
@@ -379,35 +470,38 @@ def plot_epsilon_landscape(
     ax2.legend(handles=handles, loc='upper center', fontsize=8)
 
     # =========================================================================
-    # PANEL 3 — Binary Search Path
+    # PANEL 3 — Ternary Search Path
     # =========================================================================
     ax3 = axes[1, 0]
 
-    if len(binary_evals) == 0:
-        # No binary search iterations were needed (search converged on anchor points)
+    if len(ternary_evals) == 0:
+        # No ternary refinement iterations were needed (search converged on anchor points)
         ax3.text(0.5, 0.5,
-                 "Search converged on\nanchor points\n\nNo binary search iterations needed",
+                 "Search converged on\nanchor points\n\nNo ternary refinement iterations needed",
                  fontsize=14, color='#7f8c8d', ha='center', va='center',
                  transform=ax3.transAxes)
-        ax3.set_title('Binary Search Path', fontweight='bold', fontsize=12)
+        ax3.set_title('Ternary Search Path', fontweight='bold', fontsize=12)
     else:
         # Cubic spline as a light landscape reference
         if spline is not None and x_spline is not None:
             ax3.plot(x_spline, y_spline, color=GREY_MID, alpha=0.4,
                      linewidth=2, label='Landscape')
 
-        # Binary search evaluation points, numbered in evaluation order
-        binary_eps     = [e['epsilon'] for e in binary_evals]
-        binary_scores  = [e['score']   for e in binary_evals]
+        # Ternary refinement evaluation points, numbered in evaluation order
+        ternary_eps     = [e['epsilon'] for e in ternary_evals]
+        ternary_scores  = [e['score']   for e in ternary_evals]
+        tern_clip       = _score_clip(ternary_scores + _opt_scores)
+        shown_tern, off_tern = _pin_scores(ternary_scores, tern_clip)
 
-        ax3.scatter(binary_eps, binary_scores,
+        ax3.scatter(ternary_eps, shown_tern,
                     marker='D', s=120, color=ORANGE, edgecolors='black',
-                    zorder=5, label='Binary search evaluations')
+                    zorder=5, label='Ternary search evaluations')
+        _mark_off_scale(ax3, ternary_eps, shown_tern, ternary_scores, off_tern, ORANGE)
 
-        for idx, (eps, score) in enumerate(zip(binary_eps, binary_scores), start=1):
+        for idx, (eps, shown) in enumerate(zip(ternary_eps, shown_tern), start=1):
             ax3.annotate(
                 str(idx),
-                xy=(eps, score),
+                xy=(eps, shown),
                 xytext=(0, 8),
                 textcoords='offset points',
                 fontsize=8, color=ORANGE, fontweight='bold', ha='center',
@@ -419,13 +513,17 @@ def plot_epsilon_landscape(
             opt_score = results.get(opt_key, {}).get('score', 0.0)
             if opt_score == 0.0 and spline is not None:
                 opt_score = float(spline(optimal_epsilon))
+            if tern_clip is not None:
+                opt_score = max(opt_score, tern_clip.floor)
             ax3.scatter([optimal_epsilon], [opt_score],
                         marker='*', s=350, color='red', edgecolors='darkred',
                         zorder=10, label=f'Optimal ε={optimal_epsilon:.2f}')
 
+        if tern_clip is not None:
+            ax3.set_ylim(*tern_clip.limits)
         ax3.set_xlabel('Epsilon (ε)', fontweight='bold')
         ax3.set_ylabel('CQI', fontweight='bold')
-        ax3.set_title('Binary Search Path', fontweight='bold', fontsize=12)
+        ax3.set_title('Ternary Search Path', fontweight='bold', fontsize=12)
         ax3.grid(alpha=0.3)
         ax3.legend(loc='upper right', fontsize=8)
 
@@ -447,9 +545,12 @@ def plot_epsilon_landscape(
         display_colors = list(reversed(rank_colors[:len(top3)]))  # [bronze, silver, gold]
         y_indices = list(range(len(top3_display)))   # [0, 1, 2]
 
+        top3_scores = [r[1]['score'] for r in top3_display]
+        bar_clip    = _score_clip(top3_scores)
+        shown_bars, _ = _pin_scores(top3_scores, bar_clip)
         bars = ax4.barh(
             y_indices,
-            [r[1]['score'] for r in top3_display],
+            shown_bars,
             color=display_colors,
             alpha=0.85,
             edgecolor='black',
@@ -460,11 +561,11 @@ def plot_epsilon_landscape(
 
         # Annotate each bar at the right end with accuracy / size / score
         x_max = max(r[1]['score'] for r in top3_display) if top3_display else 1.0
-        for y_pos, (eps, r) in zip(y_indices, top3_display):
+        for y_pos, (eps, r), shown in zip(y_indices, top3_display, shown_bars):
             label = (f"  {r['accuracy']:.1f}%  |  "
                      f"{r['size_mb']:.2f} MB  |  "
-                     f"score={r['score']:.3f}")
-            ax4.text(r['score'], y_pos, label,
+                     f"score={_fmt_score(r['score'])}")
+            ax4.text(shown, y_pos, label,
                      va='center', fontsize=9, color=DARK)
 
         # Tie-break annotation on the winning bar
@@ -482,7 +583,10 @@ def plot_epsilon_landscape(
         ax4.axvline(1.0, color='grey', linestyle='--', alpha=0.7,
                     label='No improvement (CQI=1.0)')
 
-        ax4.set_xlim(left=0)
+        if bar_clip is not None:
+            ax4.set_xlim(*bar_clip.limits)
+        else:
+            ax4.set_xlim(left=0)
         ax4.set_xlabel('CQI (Compression Quality Index)', fontweight='bold')
         ax4.set_title('Top 3 Candidates', fontweight='bold', fontsize=12)
         ax4.grid(axis='x', alpha=0.3)
@@ -494,6 +598,302 @@ def plot_epsilon_landscape(
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"📊 Epsilon landscape saved → '{save_path}'")
+
+
+# ============================================================================
+# ── PRUNING SEARCH (pruning-ratio / max-ratio hyperparameter search) ─────────
+# ============================================================================
+
+def plot_pruning_search(
+    results: dict,
+    search_history: list,
+    optimal_params: Optional[dict],
+    baseline_accuracy: float,
+    baseline_size: float,
+    accuracy_drop_threshold: Optional[float] = None,
+    save_path: str = 'pruning_search.png',
+) -> None:
+    """
+    Render a 4-panel visualisation of the pruning hyperparameter search.
+
+    The pruning counterpart of plot_epsilon_landscape(): purely a renderer —
+    it never runs a model or a search.  All data is supplied by
+    find_optimal_pruning_params() in optimization.py.
+
+    Panels:
+      1 (top-left)     — CQI vs global pruning ratio: the ratio anchors and the
+                         ternary-refinement points, all at the caller's
+                         max_pruning_ratio.  Trials whose CQI is far below zero
+                         (the accuracy barrier falls away exponentially past
+                         the budget: -1e8, -1e40, ...) would flatten everything
+                         else, so they are pinned to the axis floor, drawn as
+                         red-edged triangles, and their true CQI range is in
+                         the legend.
+      2 (top-right)    — Accuracy and size vs pruning ratio (same points), with
+                         the accuracy-drop budget shaded.
+      3 (bottom-left)  — Accuracy and size vs max_pruning_ratio, at the single
+                         pruning ratio the max-ratio grid was run at.
+      4 (bottom-right) — Top 5 candidates over the whole search, ranked the way
+                         the final selection ranks them (within the accuracy
+                         budget first, then by score).  A star marks the
+                         configuration the search chose.  Bars below the axis
+                         floor are pinned the same way; their true score is in
+                         the label.
+
+    Args:
+        results:           Dict returned by find_optimal_pruning_params():
+                           {cache_key: {pruning_ratio, max_pruning_ratio,
+                           iterative_steps, accuracy, size_mb, score, ...}}.
+                           May also contain a 'warning' key (str), which is ignored.
+        search_history:    Ordered list of evaluation dicts with 'phase' labels
+                           (used to number the ternary-refinement points).
+        optimal_params:    {'pruning_ratio', 'pruning_max_ratio',
+                           'iterative_steps'} chosen by the search, or None if
+                           no viable configuration existed.
+        baseline_accuracy: Original model accuracy %.
+        baseline_size:     Original model size in MB.
+        accuracy_drop_threshold: The accuracy-drop budget (pp) the search used.
+                           None = no budget band and no within-budget ranking.
+        save_path:         Destination file path for the PNG.
+    """
+    entries = [
+        v for k, v in results.items()
+        if k != 'warning' and isinstance(v, dict)
+        and 'score' in v and 'pruning_ratio' in v and 'accuracy' in v
+        and np.isfinite(v['score'])
+    ]
+    if not entries:
+        print("  [plot_pruning_search] No evaluated configurations — nothing to plot.")
+        return
+
+    BLUE     = '#3498db'
+    GREEN    = '#2ecc71'
+    RED      = '#e74c3c'
+    ORANGE   = '#f39c12'
+    GREY_MID = '#bdc3c7'
+    DARK     = '#2c3e50'
+    GOLD     = '#FFD700'
+    SILVER   = '#C0C0C0'
+    BRONZE   = '#CD7F32'
+
+    def _pr(e):    return round(float(e['pruning_ratio']), 4)
+    def _mr(e):    return round(float(e.get('max_pruning_ratio', 1.0)), 2)
+    def _steps(e): return e.get('iterative_steps', 1)
+
+    # ── Slice the evaluated configs the way the search itself explored them ───
+    # Panels 1-3 use the single-step configs (iterative_steps == 1 is what the
+    # ratio and max-ratio phases run at; the steps=2 comparison is one extra
+    # trial, shown only in panel 4).
+    one_step = [e for e in entries if _steps(e) == 1] or entries
+
+    # Panels 1-2: every ratio trial at the caller's max_pruning_ratio, which is
+    # the largest cap that appears anywhere (the grid only goes up to it).
+    base_max  = max(_mr(e) for e in one_step)
+    ratio_pts = sorted((e for e in one_step if _mr(e) == base_max), key=_pr)
+
+    # Panel 3: the max-ratio grid is the group of trials sharing one pruning
+    # ratio but spanning several caps.
+    by_ratio: dict = {}
+    for e in one_step:
+        by_ratio.setdefault(_pr(e), []).append(e)
+    grid_ratio, grid_group = max(
+        by_ratio.items(), key=lambda kv: len({_mr(x) for x in kv[1]})
+    )
+    grid_pts = sorted(grid_group, key=_mr)
+    has_grid = len({_mr(x) for x in grid_pts}) > 1
+
+    # Number the ternary-refinement points in the order they were evaluated.
+    tern_rank: dict = {}
+    for h in search_history:
+        if h.get('phase') == 'ratio_ternary' and 'pruning_ratio' in h:
+            tern_rank.setdefault(round(float(h['pruning_ratio']), 4), len(tern_rank) + 1)
+
+    opt_ratio = opt_max = None
+    opt_steps = 1
+    if optimal_params:
+        opt_ratio = optimal_params.get('pruning_ratio')
+        opt_max   = optimal_params.get('pruning_max_ratio', base_max)
+        opt_steps = optimal_params.get('iterative_steps', 1)
+
+    # ── Figure setup ─────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.patch.set_facecolor('#f8f9fa')
+
+    title = "Pruning Search — Hyperparameter Landscape"
+    if opt_ratio is not None:
+        title += (f"\noptimal: ratio={opt_ratio:.3f}, max_ratio={opt_max:.2f}, "
+                  f"steps={opt_steps}")
+    else:
+        title += "\n(no viable configuration found — pruning disabled)"
+    fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
+
+    def _budget_band(ax, accs):
+        """Baseline line + shaded within-budget band, with tidy y-limits."""
+        floor = baseline_accuracy - (accuracy_drop_threshold or 0.0)
+        lo, hi = min(list(accs) + [floor]), max(list(accs) + [baseline_accuracy])
+        pad = max(2.0, 0.05 * (hi - lo))
+        ax.set_ylim(max(-1.0, lo - pad), min(101.0, hi + pad))
+        ax.axhline(baseline_accuracy, color='grey', linestyle=':', linewidth=1.5,
+                   alpha=0.8, label=f'Baseline {baseline_accuracy:.1f}%')
+        if accuracy_drop_threshold is not None:
+            ax.axhspan(floor, baseline_accuracy + 100, color=GREEN, alpha=0.08,
+                       label=f'Within {accuracy_drop_threshold:.0f}pp budget')
+
+    def _merged_legend(ax, ax_r, loc):
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax_r.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, loc=loc, fontsize=8)
+
+    # =========================================================================
+    # PANEL 1 — CQI vs global pruning ratio
+    # =========================================================================
+    ax1   = axes[0, 0]
+    xs    = [_pr(e) for e in ratio_pts]
+    raw1  = [e['score'] for e in ratio_pts]
+    clip1 = _score_clip(raw1)
+    shown1, off1 = _pin_scores(raw1, clip1)
+    is_tern = [_pr(e) in tern_rank for e in ratio_pts]
+
+    ax1.plot(xs, shown1, linestyle='--', color=BLUE, alpha=0.4, linewidth=1.5)
+    ax1.axhline(1.0, color='grey', linestyle='--', linewidth=1.5, alpha=0.7,
+                label='No improvement (CQI=1.0)')
+    a_idx = [i for i, t in enumerate(is_tern) if not t]
+    t_idx = [i for i, t in enumerate(is_tern) if t]
+    if a_idx:
+        ax1.scatter([xs[i] for i in a_idx], [shown1[i] for i in a_idx],
+                    s=150, color=BLUE, edgecolors='black', zorder=5,
+                    label='Ratio anchors')
+        for i in a_idx:
+            ax1.annotate(f'r={xs[i]:.2f}', xy=(xs[i], shown1[i]), xytext=(0, 9),
+                         textcoords='offset points', fontsize=8, color=DARK,
+                         ha='center')
+    if t_idx:
+        ax1.scatter([xs[i] for i in t_idx], [shown1[i] for i in t_idx],
+                    marker='D', s=110, color=ORANGE, edgecolors='black', zorder=6,
+                    label='Ternary refinement')
+        for i in t_idx:
+            ax1.annotate(str(tern_rank[xs[i]]), xy=(xs[i], shown1[i]),
+                         xytext=(0, 8), textcoords='offset points', fontsize=8,
+                         color=ORANGE, fontweight='bold', ha='center')
+    _mark_off_scale(ax1, xs, shown1, raw1, off1, BLUE)
+    if opt_ratio is not None:
+        ax1.axvline(opt_ratio, color='red', linestyle='--', linewidth=1.5,
+                    alpha=0.7, label=f'Optimal ratio={opt_ratio:.3f}')
+    if clip1 is not None:
+        ax1.set_ylim(*clip1.limits)
+    ax1.set_xlabel('Global pruning ratio', fontweight='bold')
+    ax1.set_ylabel('CQI', fontweight='bold')
+    ax1.set_title(f'CQI vs Pruning Ratio  (max_ratio={base_max:.2f})',
+                  fontweight='bold', fontsize=12)
+    ax1.grid(alpha=0.3)
+    ax1.legend(loc='best', fontsize=8)
+
+    # =========================================================================
+    # PANEL 2 — Accuracy vs size across the ratio trials (dual axis)
+    # =========================================================================
+    ax2   = axes[0, 1]
+    ax2_r = ax2.twinx()
+    accs  = [e['accuracy'] for e in ratio_pts]
+    ax2.plot(xs, accs, color=GREEN, marker='o', linewidth=2, markersize=7,
+             label='Accuracy (%)')
+    ax2_r.plot(xs, [e['size_mb'] for e in ratio_pts], color=RED, marker='s',
+               linewidth=2, markersize=7, linestyle='--', label='Size (MB)')
+    _budget_band(ax2, accs)
+    if opt_ratio is not None:
+        ax2.axvline(opt_ratio, color='grey', linestyle='--', linewidth=1.5,
+                    alpha=0.6, label=f'Optimal ratio={opt_ratio:.3f}')
+    ax2.set_xlabel('Global pruning ratio', fontweight='bold')
+    ax2.set_ylabel('Accuracy (%)', color=GREEN, fontweight='bold')
+    ax2_r.set_ylabel('Size (MB)', color=RED, fontweight='bold')
+    ax2.set_title('Ratio Trials — Accuracy vs Size', fontweight='bold', fontsize=12)
+    ax2.grid(alpha=0.3)
+    _merged_legend(ax2, ax2_r, 'upper right')
+
+    # =========================================================================
+    # PANEL 3 — Accuracy vs size across the max-ratio grid (dual axis)
+    # =========================================================================
+    ax3 = axes[1, 0]
+    if not has_grid:
+        ax3.text(0.5, 0.5, "Max-ratio grid was not run\n(search stopped before Phase 2)",
+                 fontsize=14, color='#7f8c8d', ha='center', va='center',
+                 transform=ax3.transAxes)
+        ax3.set_title('Max-Ratio Grid', fontweight='bold', fontsize=12)
+    else:
+        ax3_r = ax3.twinx()
+        gx    = [_mr(e) for e in grid_pts]
+        gaccs = [e['accuracy'] for e in grid_pts]
+        ax3.plot(gx, gaccs, color=GREEN, marker='o', linewidth=2, markersize=7,
+                 label='Accuracy (%)')
+        ax3_r.plot(gx, [e['size_mb'] for e in grid_pts], color=RED, marker='s',
+                   linewidth=2, markersize=7, linestyle='--', label='Size (MB)')
+        _budget_band(ax3, gaccs)
+        if opt_max is not None and opt_ratio is not None:
+            ax3.axvline(opt_max, color='grey', linestyle='--', linewidth=1.5,
+                        alpha=0.6, label=f'Optimal max_ratio={opt_max:.2f}')
+        ax3.set_xlabel('max_pruning_ratio (per-group cap)', fontweight='bold')
+        ax3.set_ylabel('Accuracy (%)', color=GREEN, fontweight='bold')
+        ax3_r.set_ylabel('Size (MB)', color=RED, fontweight='bold')
+        ax3.set_title(f'Max-Ratio Grid  (pruning ratio fixed at {grid_ratio:.2f})',
+                      fontweight='bold', fontsize=12)
+        ax3.grid(alpha=0.3)
+        _merged_legend(ax3, ax3_r, 'upper right')
+
+    # =========================================================================
+    # PANEL 4 — Top candidates over the whole search (best at top)
+    # =========================================================================
+    ax4 = axes[1, 1]
+    within = []
+    if accuracy_drop_threshold is not None:
+        within = [e for e in entries
+                  if baseline_accuracy - e['accuracy'] <= accuracy_drop_threshold]
+    pool   = within if within else entries
+    ranked = sorted(pool, key=lambda e: e['score'], reverse=True)[:5]
+
+    def _is_chosen(e):
+        return (opt_ratio is not None
+                and abs(_pr(e) - round(float(opt_ratio), 4)) < 1e-6
+                and abs(_mr(e) - round(float(opt_max), 2)) < 1e-6
+                and _steps(e) == opt_steps)
+
+    display = list(reversed(ranked))                       # best at the top of the chart
+    colors  = list(reversed(([GOLD, SILVER, BRONZE] + [GREY_MID] * 2)[:len(ranked)]))
+    y_idx   = list(range(len(display)))
+    raw4    = [e['score'] for e in display]
+    clip4   = _score_clip(raw4)
+    shown4, off4 = _pin_scores(raw4, clip4)
+    ax4.barh(y_idx, shown4, color=colors, alpha=0.85, edgecolor='black')
+    ax4.set_yticks(y_idx)
+    ax4.set_yticklabels([
+        f"{'★ ' if _is_chosen(e) else ''}r={_pr(e):.2f}  max={_mr(e):.2f}  "
+        f"steps={_steps(e)}"
+        for e in display
+    ], fontsize=9)
+    # Accuracy / size / true score sit inside the axes, so long labels do not
+    # squeeze the neighbouring panels.
+    for yi, e, off in zip(y_idx, display, off4):
+        ax4.text(0.01, yi,
+                 f"{e['accuracy']:.1f}%  |  {e['size_mb']:.1f} MB  |  "
+                 f"score={_fmt_score(e['score'])}{'  ▼ off-scale' if off else ''}",
+                 transform=ax4.get_yaxis_transform(), va='center', ha='left',
+                 fontsize=8, color=DARK)
+    ax4.axvline(1.0, color='grey', linestyle='--', alpha=0.7,
+                label='No improvement (CQI=1.0)')
+    if clip4 is not None:
+        ax4.set_xlim(*clip4.limits)
+    ax4.set_xlabel('CQI', fontweight='bold')
+    ax4.set_title(
+        (f'Top Candidates (within {accuracy_drop_threshold:.0f}pp budget)' if within
+         else 'Top Candidates (none within budget — ranked by score only)'),
+        fontweight='bold', fontsize=12)
+    ax4.grid(axis='x', alpha=0.3)
+    ax4.legend(loc='lower right', fontsize=8)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(save_path, dpi=200, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"📊 Pruning search saved → '{save_path}'")
 
 
 # ============================================================================

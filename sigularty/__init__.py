@@ -14,6 +14,7 @@ Public interface:
     plot_compression_report(result, model, dl)   -> str (PNG path)
     plot_pruning_report(result)                  -> str or None
     plot_epsilon_landscape(...)                  -> str (PNG path)
+    plot_pruning_search(...)                     -> str or None (PNG path)
 
 Everything else (pipeline internals, search algorithms, visualisation) lives
 in this package as plain Python modules and isn't re-exported at this top
@@ -48,6 +49,7 @@ from sigularty._api import (
     plot_compression_report,
     plot_pruning_report,
     plot_epsilon_landscape,
+    plot_pruning_search,
     CompressionResult,
     AnalysisResult,
     LayerSignal,
@@ -65,10 +67,11 @@ __all__ = [
     "plot_compression_report",
     "plot_pruning_report",
     "plot_epsilon_landscape",
+    "plot_pruning_search",
     "CompressionResult",
     "AnalysisResult",
     "LayerSignal",
     "RegistryResult",
 ]
 
-__version__ = "1.1.4"
+__version__ = "1.2.0"

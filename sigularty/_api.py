@@ -12,6 +12,7 @@ visualization.py.
 from __future__ import annotations
 
 import copy
+import math
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -80,13 +81,19 @@ class CompressionResult:
     original_accuracy   Original model top-1 accuracy % on test_loader.
     compressed_accuracy Compressed model top-1 accuracy % on test_loader.
     original_latency_ms Mean inference latency (ms) of the original model,
-                        timed on the same device the final compressed model
-                        runs on.
-    compressed_latency_ms Mean inference latency (ms) of the final compressed
-                        model (after GPTQ, quantization, and KD), on the
-                        device it actually runs on.
-    latency_speedup     original_lat / compressed_lat. >1.0 = faster.
+                        timed on the device the compressed model runs on —
+                        the original's home device except for
+                        quant_mode='dynamic' (CPU-only), where it is re-timed
+                        on CPU so the comparison is like-for-like.
+    compressed_latency_ms Mean inference latency (ms) of result.model itself:
+                        the final model (after GPTQ / quantization / KD / fp16),
+                        on the device it runs on, in its own dtype. nan if
+                        timing it failed.
+    latency_speedup     original_lat / compressed_lat. >1.0 = faster. nan if
+                        the final model could not be timed.
     cqi                 Compression Quality Index (accuracy × size × latency).
+                        Computed without its latency factor if the final model
+                        could not be timed.
     techniques_applied  List of technique names in pipeline order. Only
                         techniques that actually survived their accuracy
                         gate are listed — a reverted technique is not
@@ -94,6 +101,11 @@ class CompressionResult:
     report_path         Absolute path to saved PNG report, or None.
     pruning_report      Dict with per-layer pruning details, or None (also
                         None if pruning ran but was reverted by the gate).
+    epsilon_landscape_path  Absolute path to the saved epsilon-search graph, or
+                        None (the epsilon search did not run, save_report was
+                        False, or there was nothing to plot).
+    pruning_search_path Absolute path to the saved pruning-search graph; same
+                        rules.
     """
     model:                nn.Module
     compression_ratio:    float
@@ -109,6 +121,10 @@ class CompressionResult:
     techniques_applied:   List[str]
     report_path:          Optional[str]
     pruning_report:       Optional[dict]
+    # Hyperparameter-search graphs (see compress()). Last, with defaults, so
+    # code that builds a CompressionResult by hand keeps working.
+    epsilon_landscape_path: Optional[str] = None
+    pruning_search_path:    Optional[str] = None
 
     def __repr__(self) -> str:
         return (
@@ -378,6 +394,11 @@ def compress(
     # ── Report ────────────────────────────────────────────────────────────────
     save_report:             bool            = True,
     report_path:             str             = 'compression_report.png',
+    # Search graphs: saved right after find_optimal_epsilon / find_optimal_pruning
+    # runs, and only when save_report=True. Their paths come back on
+    # CompressionResult.epsilon_landscape_path / .pruning_search_path.
+    epsilon_landscape_path:  str             = 'epsilon_landscape.png',
+    pruning_search_path:     str             = 'pruning_search.png',
 ) -> CompressionResult:
     """
     Compress a PyTorch model.
@@ -408,13 +429,26 @@ def compress(
     so the model is never fine-tuned and then graded on the exact same
     samples. See _auto_split_dataloader's docstring for the mechanics.
 
-    Accuracy, size, and latency are all measured on the final compressed
-    model — after GPTQ, quantization, and KD — on the device it actually runs
-    on, with the same iteration and warmup settings the baseline used.  GPTQ
-    and fp16 stay on the main compute device.  Dynamic INT8 has no CUDA
-    kernel and runs on CPU, so in that case the original model is timed on
-    CPU as well, and original_latency_ms, compressed_latency_ms,
-    latency_speedup, and cqi all compare CPU against CPU.
+    Accuracy, size and latency are all measured on the model this function
+    returns — after GPTQ, quantization, KD and the final fp16 cast — never on
+    an intermediate stage. Latency is timed on the device that final model
+    actually runs on, in its own dtype. Dynamic INT8 only runs on CPU, so with
+    quant_mode='dynamic' the ORIGINAL model is re-timed on CPU as well (on a
+    throwaway copy; yours is never moved) and original_latency_ms is that CPU
+    number — the two latencies and the speedup always compare like with like.
+    If timing the final model fails, the compressed model is still returned:
+    compressed_latency_ms and latency_speedup are nan, cqi is computed without
+    its latency factor, and a warning prints. See _final_latency.
+
+    Search graphs: when find_optimal_epsilon / find_optimal_pruning runs and
+    save_report=True, that search's graph is saved right after the search
+    finishes — epsilon_landscape_path (CQI vs epsilon, accuracy vs size, the
+    ternary refinement path, top candidates) and pruning_search_path (CQI and
+    accuracy/size vs pruning ratio, the max-ratio grid, top candidates) — and
+    its absolute path is returned on CompressionResult.epsilon_landscape_path /
+    .pruning_search_path. They are None when that search didn't run,
+    save_report=False, or there was nothing to plot; a rendering failure only
+    prints a warning and never stops the run.
 
     Accuracy-drop gating is always active: Structured Pruning, Low-Rank
     Factorization, and Weight Clustering, and GPTQ, standard Quantization,
@@ -461,16 +495,16 @@ def compress(
 
     CQI accuracy factor (all cqi_w_* args and the final result.cqi): every
     compression_quality_index() call this function makes — the compressed
-    model's final CQI, and every trial score inside the two searches —
-    passes accuracy_drop_threshold straight through, which selects the
-    three-piece barrier accuracy factor (see optimization.py's
-    compression_quality_index docstring) rather than the plain
-    (accuracy/baseline_accuracy)**cqi_w_accuracy ratio. Under the barrier
-    factor, an unbounded size/latency ratio cannot buy back an accuracy drop
+    model's final CQI, and every trial score inside the two searches — now
+    passes accuracy_drop_threshold straight through, which is what opts them
+    into the new three-piece barrier accuracy factor (see
+    optimization.py's compression_quality_index docstring) instead of the
+    legacy (accuracy/baseline_accuracy)**cqi_w_accuracy ratio. This is the
+    fix for the original defect that motivated the barrier factor: an
+    unbounded size/latency ratio can no longer buy back an accuracy drop
     that is at or past accuracy_drop_threshold — the accuracy factor falls
     away unboundedly on its own once a config reaches that point, whatever
-    the compression ratio.  The latency factor uses the final model's
-    latency (see the note above), not an intermediate stage's.
+    the compression ratio.
     """
     # ── Deferred imports ────────────────────────────────
     from sigularty.compression import (
@@ -493,7 +527,11 @@ def compress(
         find_optimal_epsilon_smart,
         find_optimal_pruning_params,
     )
-    from sigularty.visualization import generate_compression_report
+    from sigularty.visualization import (
+        generate_compression_report,
+        plot_epsilon_landscape as _plot_epsilon_landscape,
+        plot_pruning_search as _plot_pruning_search,
+    )
 
     # ── Device resolution ─────────────────────────────────────────────────────
     if device is None:
@@ -505,9 +543,10 @@ def compress(
         quant_mode = 'dynamic'
 
     # ── Evaluation data — resolve test_loader before anything touches the
-    #    data, including the optional pre-training step below, so
-    #    pre-training never trains on data that is later treated as held
-    #    out. ───────────────────────────────────────────────────────────────
+    #    data, including the optional pre-training step below. If pretrain
+    #    trained on data that later gets called "held out", every downstream
+    #    measurement against that data would be contaminated the same way
+    #    the whole rest of this fix exists to prevent. ─────────────────────────
     if test_loader is None:
         dataloader, test_loader = _auto_split_dataloader(dataloader)
 
@@ -553,6 +592,10 @@ def compress(
     print(f"  Baseline: {baseline_acc:.2f}%  {baseline_size:.2f} MB  "
           f"{baseline_latency:.3f} ms")
 
+    # Paths of the search graphs, filled in right after each search runs.
+    out_eps_plot:   Optional[str] = None
+    out_prune_plot: Optional[str] = None
+
     # ── Optional: epsilon search ──────────────────────────────────────────────
     if find_optimal_epsilon and use_lrf:
         _eps_cache_path = epsilon_cache_path or (
@@ -560,7 +603,7 @@ def compress(
         )
         print(f"\n[compress] LRF epsilon search ({epsilon_search_trials} trials)...")
         print(f"  Cache: '{_eps_cache_path}'")
-        best_eps, _, _ = find_optimal_epsilon_smart(
+        best_eps, _eps_results, _eps_history = find_optimal_epsilon_smart(
             model=model,
             test_loader=test_loader,
             device=device,
@@ -577,6 +620,13 @@ def compress(
             w_size=cqi_w_size,
             w_latency=cqi_w_latency,
         )
+        if save_report and _has_scored_entries(_eps_results):
+            out_eps_plot = _save_search_plot(
+                _plot_epsilon_landscape, epsilon_landscape_path, "epsilon landscape",
+                results=_eps_results, search_history=_eps_history,
+                optimal_epsilon=best_eps,
+                baseline_accuracy=baseline_acc, baseline_size=baseline_size,
+            )
         if best_eps is not None:
             print(f"  → Optimal ε = {best_eps:.4f}")
             lrf_epsilon = best_eps
@@ -591,7 +641,7 @@ def compress(
         )
         print(f"\n[compress] Pruning search ({pruning_search_trials} trials)...")
         print(f"  Cache: '{_prune_cache_path}'")
-        best_cfg, _, _ = find_optimal_pruning_params(
+        best_cfg, _prune_results, _prune_history = find_optimal_pruning_params(
             model=model,
             dataloader=dataloader,
             test_loader=test_loader,
@@ -616,6 +666,14 @@ def compress(
             w_latency=cqi_w_latency,
             w_kl=cqi_w_kl,
         )
+        if save_report and _has_scored_entries(_prune_results):
+            out_prune_plot = _save_search_plot(
+                _plot_pruning_search, pruning_search_path, "pruning search",
+                results=_prune_results, search_history=_prune_history,
+                optimal_params=best_cfg,
+                baseline_accuracy=baseline_acc, baseline_size=baseline_size,
+                accuracy_drop_threshold=accuracy_drop_threshold,
+            )
         if best_cfg is not None:
             pruning_ratio           = best_cfg.get('pruning_ratio',     pruning_ratio)
             pruning_max_ratio       = best_cfg.get('pruning_max_ratio', pruning_max_ratio)
@@ -628,12 +686,11 @@ def compress(
             use_pruning = False
 
     # ── Structural compression (float32) ───────────────────────────────────────
-    # BN Fusion, Pruning, LRF, Clustering. Quantization is deferred: SVD and
-    # k-means need float32 weights, and dynamic INT8 (qint8) has no CUDA
-    # kernel, so it moves the model to CPU. KD fine-tuning is also deferred
-    # so it runs exactly once, after quantization/GPTQ, and can recover
-    # accuracy lost to all of them at once rather than just to the
-    # structural changes.
+    # BN Fusion, Pruning, LRF, Clustering. Quantization is deferred:
+    # quantized tensors (qint8) have no CUDA kernel, which would make GPU
+    # latency comparisons unfair. KD fine-tuning is also deferred so it runs
+    # exactly once, after quantization/GPTQ, and can recover accuracy lost
+    # to all of them at once rather than just to the structural changes.
     print("\n[compress] Structural compression...")
     compressed_pre_quant = apply_compression_pipeline(
         model=model,
@@ -1010,33 +1067,21 @@ def compress(
     # current_accuracy already reflects the correctly-measured, final state
     # from whichever gate/re-measurement above touched it last — reusing it
     # here avoids a redundant measure_accuracy() call for an identical number.
-    # Latency has no such running value: it is timed here, once, on the model
-    # that is actually returned (post-GPTQ/quantization/KD, post-fp16 recast),
-    # on the device that model lives on, with the same iteration and warmup
-    # settings the baseline used so the two numbers are directly comparable.
     print(f"\n[compress] Evaluating compressed model (on {acc_device})...")
     comp_acc  = current_accuracy
     comp_size = get_model_size_mb(compressed_model)
 
-    if acc_device == device:
-        original_latency = baseline_latency
-    else:
-        # The final model lives on a different device than the one the
-        # baseline was timed on (dynamic INT8 is CPU-only). A GPU baseline
-        # against a CPU result is not a meaningful speedup, so a copy of the
-        # original is timed on the final model's device instead. A copy,
-        # because measure_latency moves the model it is given.
-        print(f"  Final model runs on {acc_device}, baseline was timed on "
-              f"{device} — timing the original on {acc_device} so both "
-              f"latencies share a device...")
-        original_latency = measure_latency(
-            copy.deepcopy(model), input_shape, acc_device,
-            num_iterations=50, warmup=5, input_dtype=input_dtype,
-        )['mean_ms']
-    comp_latency = measure_latency(
-        compressed_model, input_shape, acc_device,
-        num_iterations=50, warmup=5, input_dtype=input_dtype,
-    )['mean_ms']
+    # ── Latency of the model actually being returned ──────────────────────────
+    # Timed on the FINAL model (after GPTQ / quantization / KD / QAT collapse /
+    # fp16 recast), on the device it actually runs on, in its own dtype — never
+    # on an intermediate stage. See _final_latency for the same-device rule
+    # (dynamic INT8) and the failure behaviour.
+    ref_latency, comp_latency = _final_latency(
+        model, compressed_model, input_shape, input_dtype,
+        device, acc_device, baseline_latency, measure_latency,
+    )
+    _comp_lat_ok = math.isfinite(comp_latency) and comp_latency > 0
+    _lat_ok      = _comp_lat_ok and math.isfinite(ref_latency) and ref_latency > 0
 
     # ── What actually survived gating ─────────────────────────────────────────
     # A technique that got reverted by its own accuracy gate must not be
@@ -1065,18 +1110,17 @@ def compress(
         techniques.append(f'KD Fine-tune (T={kd_temperature:.1f}, α={kd_alpha:.2f})')
 
     # ── CQI ───────────────────────────────────────────────────────────────────
-    # accuracy_drop_threshold is passed straight through here too, so the
-    # headline CQI on CompressionResult uses the barrier accuracy factor, the
-    # same as every trial score inside the two searches above. The latency
-    # factor compares the final model against the original on the same
-    # device.
+    # accuracy_drop_threshold is passed straight through here too — this is
+    # what makes the FINAL, headline CQI displayed on CompressionResult use
+    # the new barrier accuracy factor rather than the legacy ratio, exactly
+    # like every trial score inside the two searches above already does.
     cqi = compression_quality_index(
         accuracy=comp_acc,
         size_mb=comp_size,
         baseline_accuracy=baseline_acc,
         baseline_size=baseline_size,
-        latency_ms=comp_latency,
-        baseline_latency_ms=original_latency,
+        latency_ms=comp_latency if _lat_ok else None,
+        baseline_latency_ms=ref_latency if _lat_ok else None,
         accuracy_drop_threshold=accuracy_drop_threshold,
         w_accuracy=cqi_w_accuracy,
         w_size=cqi_w_size,
@@ -1094,8 +1138,8 @@ def compress(
                 'compressed_size_mb':    comp_size,
                 'original_params':       count_parameters(model),
                 'compressed_params':     count_parameters(compressed_model),
-                'original_latency_ms':   original_latency,
-                'compressed_latency_ms': comp_latency,
+                'original_latency_ms':   ref_latency,
+                'compressed_latency_ms': comp_latency if _comp_lat_ok else None,
                 'techniques_used':       techniques,
                 'cqi':                   cqi,
                 'pruning_report':        pruning_rep,
@@ -1114,15 +1158,21 @@ def compress(
             print(f"  ⚠️  Report generation failed: {exc}")
 
     # ── Derived scalars ───────────────────────────────────────────────────────
-    lat_speedup   = (original_latency / comp_latency) if comp_latency > 0 else 1.0
+    lat_speedup   = (ref_latency / comp_latency) if _lat_ok else float('nan')
     acc_retention = (comp_acc / baseline_acc * 100)   if baseline_acc  > 0 else 0.0
     comp_ratio    = (baseline_size / comp_size)        if comp_size     > 0 else 1.0
 
     print(f"\n[compress] Done.")
     print(f"  Ratio       : {comp_ratio:.2f}×")
-    print(f"  Accuracy    : {baseline_acc:.2f}% → {comp_acc:.2f}% (retention {acc_retention:.1f}%)")
+    print(f"  Accuracy    : {baseline_acc:.2f}% → {comp_acc:.2f}%  "
+          f"(retention {acc_retention:.1f}%)")
     print(f"  Size        : {baseline_size:.2f} MB → {comp_size:.2f} MB")
-    print(f"  Latency     : {original_latency:.3f} ms → {comp_latency:.3f} ms ({lat_speedup:.2f}× speedup)")
+    if _lat_ok:
+        _same_dev = f"  [both timed on {acc_device}]" if acc_device != device else ""
+        print(f"  Latency     : {ref_latency:.3f} ms → {comp_latency:.3f} ms  "
+              f"({lat_speedup:.2f}× speedup){_same_dev}")
+    else:
+        print("  Latency     : N/A — could not time the final model (see warning above)")
     print(f"  CQI         : {cqi:.3f}")
 
     return CompressionResult(
@@ -1133,13 +1183,15 @@ def compress(
         size_compressed_mb=comp_size,
         original_accuracy=baseline_acc,
         compressed_accuracy=comp_acc,
-        original_latency_ms=original_latency,
+        original_latency_ms=ref_latency,
         compressed_latency_ms=comp_latency,
         latency_speedup=lat_speedup,
         cqi=cqi,
         techniques_applied=techniques,
         report_path=out_report_path,
         pruning_report=pruning_rep,
+        epsilon_landscape_path=out_eps_plot,
+        pruning_search_path=out_prune_plot,
     )
 
 
@@ -1458,20 +1510,122 @@ def _infer_input_shape_and_dtype(
     Return (input_shape, input_dtype) from the first dataloader batch.
 
     input_shape:  (1, ...) — a single-example shape.
-    input_dtype:  the batch's own dtype — torch.long for NLP token-ID
-                  inputs, torch.float32 for vision pixels, etc. Needed so
-                  every per-technique impact report's latency measurement
-                  (measure_latency's input_dtype param) builds a dummy
-                  input of the right kind.
+    input_dtype:  None for floating-point inputs (vision pixels); the batch's
+                  own dtype (torch.long) for integer inputs (NLP token IDs).
+
+                  It is None — not torch.float32 — for vision on purpose.
+                  measure_latency only builds its dummy input in the model's
+                  own current dtype when input_dtype is None; passing a fixed
+                  float32 forces float32 input into whatever model is being
+                  timed, which fails for any fp16 model (a Float-vs-Half
+                  mismatch). That is why every latency measurement of an fp16
+                  stage failed here while the CLI path, which passes None for
+                  vision registry models, was fine.
 
     Falls back to ((1, 3, 224, 224), None) if the batch cannot be read —
     matching measure_latency's own float32 default for the dtype.
     """
     try:
         x, _ = next(iter(dataloader))
-        return tuple(x[:1].shape), x.dtype
+        input_dtype = None if x.is_floating_point() else x.dtype
+        return tuple(x[:1].shape), input_dtype
     except Exception:
         return (1, 3, 224, 224), None
+
+
+def _final_latency(
+    model: nn.Module,
+    compressed_model: nn.Module,
+    input_shape: tuple,
+    input_dtype,
+    device: str,
+    acc_device: str,
+    baseline_latency: float,
+    measure_fn,
+    num_iterations: int = 50,
+    warmup: int = 5,
+) -> Tuple[float, float]:
+    """
+    Latency pair (reference_ms, compressed_ms) for the model compress() returns.
+
+    compressed_ms is the mean latency of `compressed_model` — the FINAL model,
+    after GPTQ / quantization / KD / QAT collapse / fp16 recast — timed on
+    acc_device, the device it actually runs on, in its own dtype (input_dtype
+    is None for vision inputs, so measure_fn matches the model's dtype).
+
+    reference_ms is `baseline_latency` (timed on `device` earlier) whenever the
+    final model also runs on `device`. If the final model runs elsewhere —
+    dynamic INT8 is CPU-only — a GPU-vs-CPU ratio would be meaningless, so the
+    original is re-timed on acc_device, on a throwaway deep copy so the
+    caller's `model` is never moved.
+
+    Never raises: the compressed model is the product of a long run and must
+    not be lost to a timing failure at the very end. On any failure a warning
+    prints and compressed_ms is nan (reference_ms falls back to
+    baseline_latency); compress() then leaves the latency fields as nan and
+    scores CQI without its latency factor.
+
+    measure_fn is helper_functions.measure_latency, passed in because
+    compress() imports it lazily.
+    """
+    ref_latency = baseline_latency
+    try:
+        if acc_device != device:
+            print(f"  [compress] Final model runs on {acc_device}, baseline was timed on "
+                  f"{device} — re-timing the baseline on {acc_device} so the speedup "
+                  f"compares like with like.")
+            baseline_copy = copy.deepcopy(model)
+            ref_latency = measure_fn(
+                baseline_copy, input_shape, acc_device,
+                num_iterations=num_iterations, warmup=warmup,
+                input_dtype=input_dtype,
+            )['mean_ms']
+            del baseline_copy
+        comp_latency = measure_fn(
+            compressed_model, input_shape, acc_device,
+            num_iterations=num_iterations, warmup=warmup,
+            input_dtype=input_dtype,
+        )['mean_ms']
+        return ref_latency, comp_latency
+    except Exception as exc:
+        print(f"  ⚠️  [compress] Could not time the final model "
+              f"({type(exc).__name__}: {exc}). compressed_latency_ms and "
+              f"latency_speedup will be nan and cqi is computed without its "
+              f"latency factor; the compressed model itself is unaffected.")
+        return baseline_latency, float('nan')
+
+
+def _none_if_nan(value):
+    """nan -> None, so report code that treats None as 'not measured' does."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return value
+
+
+def _has_scored_entries(results) -> bool:
+    """True if a search's results dict holds at least one evaluated (scored) trial."""
+    return isinstance(results, dict) and any(
+        k != 'warning' and isinstance(v, dict) and 'score' in v
+        for k, v in results.items()
+    )
+
+
+def _save_search_plot(plot_fn, save_path: str, label: str, **kwargs) -> Optional[str]:
+    """
+    Render one hyperparameter-search graph for compress().
+
+    Never raises: the graph is a by-product, and a rendering problem (a missing
+    plotting dependency, an unexpected results shape) must not stop a
+    compression run that is hours in. Returns the absolute path of the saved
+    PNG, or None if rendering failed.
+    """
+    try:
+        plot_fn(save_path=save_path, **kwargs)
+        return os.path.abspath(save_path)
+    except Exception as exc:
+        print(f"  ⚠️  [compress] Could not render the {label} graph "
+              f"({type(exc).__name__}: {exc}) — continuing without it.")
+        return None
 
 
 def _auto_split_dataloader(
@@ -1703,7 +1857,7 @@ def run_onnx_inference(
     """
     Load an exported .onnx file into an ONNX Runtime session and measure its
     real accuracy and latency on that runtime — not PyTorch's, the actual
-    engine most deployment targets (mobile, edge, serving) run on.
+    engine most deployment targets (mobile, edge, serving) run.
 
     Runs top-1 accuracy over the full `dataloader` on ONNX Runtime's CPU
     execution provider, then times `num_latency_iterations` dummy forward
@@ -1793,8 +1947,8 @@ def plot_compression_report(
     device          : Device for metric fallback computation. Auto-detected.
     accuracy_drop_threshold: The accuracy_drop_threshold you passed to
                       compress() for this result, if you want the CQI shown
-                      here (should it need recomputing) to use the barrier
-                      accuracy factor rather than the legacy ratio.
+                      here (should it need recomputing) to use the new
+                      barrier accuracy factor rather than the legacy ratio.
                       Not required — result.cqi is already attached to
                       metrics_dict below and generate_compression_report()
                       only falls back to recomputing CQI when it's missing,
@@ -1827,8 +1981,8 @@ def plot_compression_report(
         'compressed_accuracy':   result.compressed_accuracy,
         'original_size_mb':      result.size_original_mb,
         'compressed_size_mb':    result.size_compressed_mb,
-        'original_latency_ms':   result.original_latency_ms,
-        'compressed_latency_ms': result.compressed_latency_ms,
+        'original_latency_ms':   _none_if_nan(result.original_latency_ms),
+        'compressed_latency_ms': _none_if_nan(result.compressed_latency_ms),
         'techniques_used':       result.techniques_applied,
         'cqi':                   result.cqi,
         'pruning_report':        result.pruning_report,
@@ -1924,8 +2078,10 @@ def plot_epsilon_landscape(
     Shows CQI scores across epsilon values, accuracy vs size tradeoff,
     the binary search convergence path, and the top 3 candidate epsilons.
 
-    This is automatically called by compress() when find_optimal_epsilon=True.
-    Call it manually if you ran the search yourself via optimization functions.
+    compress() calls this automatically after the epsilon search when
+    find_optimal_epsilon=True and save_report=True (the path comes back as
+    CompressionResult.epsilon_landscape_path). Call it manually if you ran the
+    search yourself via the optimization functions.
 
     Parameters
     ----------
@@ -1959,6 +2115,90 @@ def plot_epsilon_landscape(
         optimal_epsilon=optimal_epsilon,
         baseline_accuracy=baseline_accuracy,
         baseline_size=baseline_size_mb,
+        save_path=save_path,
+    )
+    abs_path = os.path.abspath(save_path)
+
+    if show_in_notebook:
+        try:
+            from IPython.display import Image, display
+            display(Image(abs_path))
+        except Exception:
+            pass
+
+    return abs_path
+
+
+def plot_pruning_search(
+    pruning_results:   dict,
+    search_history:    list,
+    optimal_params:    Optional[dict],
+    baseline_accuracy: float,
+    baseline_size_mb:  float,
+    *,
+    accuracy_drop_threshold: Optional[float] = None,
+    save_path: str  = 'pruning_search.png',
+    show_in_notebook: bool = True,
+) -> Optional[str]:
+    """
+    Render the pruning hyperparameter search.
+
+    Four panels: CQI vs global pruning ratio (anchors + ternary refinement),
+    accuracy and size vs ratio with the accuracy budget shaded, accuracy and
+    size across the max-ratio grid, and the top candidates over the whole
+    search. Trials whose CQI is far below zero (the accuracy barrier falls
+    away exponentially past the budget) are pinned to the axis floor and
+    flagged with their true value rather than flattening the rest of the plot.
+
+    compress() calls this automatically after the pruning search when
+    find_optimal_pruning=True and save_report=True (the path comes back as
+    CompressionResult.pruning_search_path). Call it manually if you ran the
+    search yourself via the optimization functions.
+
+    Parameters
+    ----------
+    pruning_results   : Dict of {cache_key: {pruning_ratio, max_pruning_ratio,
+                        iterative_steps, accuracy, size_mb, score, ...}} from
+                        find_optimal_pruning_params().
+    search_history    : Ordered list of evaluation dicts from the same call.
+    optimal_params    : {'pruning_ratio', 'pruning_max_ratio',
+                        'iterative_steps'} the search chose, or None if no
+                        viable configuration existed.
+    baseline_accuracy : Original model accuracy %.
+    baseline_size_mb  : Original model size in MB.
+    accuracy_drop_threshold : The accuracy-drop budget (pp) the search used.
+                        None = no budget band and no within-budget ranking.
+    save_path         : Output PNG path.
+    show_in_notebook  : Display inline in Jupyter/Colab if True.
+
+    Returns
+    -------
+    str — absolute path to the saved PNG, or None if there were no evaluated
+    configurations to plot.
+
+    Example
+    -------
+    >>> # Typically called automatically. Manual use:
+    >>> from sigularty import plot_pruning_search
+    >>> plot_pruning_search(results, history, best_cfg, 77.4, 327.6,
+    ...                     accuracy_drop_threshold=10.0)
+    """
+    if not _has_scored_entries(pruning_results):
+        print("  [plot_pruning_search] No evaluated configurations — nothing to plot.")
+        return None
+
+    try:
+        from sigularty.visualization import plot_pruning_search as _pps
+    except ImportError:
+        from visualization import plot_pruning_search as _pps
+
+    _pps(
+        results=pruning_results,
+        search_history=search_history,
+        optimal_params=optimal_params,
+        baseline_accuracy=baseline_accuracy,
+        baseline_size=baseline_size_mb,
+        accuracy_drop_threshold=accuracy_drop_threshold,
         save_path=save_path,
     )
     abs_path = os.path.abspath(save_path)
