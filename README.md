@@ -44,8 +44,10 @@ helper_functions.py             ← Everything else: data loading, model loading
                                    training, accuracy/latency measurement, ONNX
                                    export, pipeline orchestration, CLI parsing.
 
-visualization.py                ← All PNG report generation.
-                                   Never runs models. Only renders data it receives.
+visualization.py                ← All PNG report generation: the compression report,
+                                   the pruning report, and the epsilon / pruning
+                                   search graphs. Never runs models. Only renders
+                                   data it receives.
 
 model_registry.py               ← 20 model definitions.
                                    Loader functions + metadata + recommended configs.
@@ -98,11 +100,7 @@ GPTQ, Quantization, and the final KD step are gated separately in
 after the float32 stages for latency comparisons to stay fair.
 
 All final metrics (accuracy, size, latency) are measured on the actually-deployed
-compressed model, never an intermediate one. `python main.py` times the final model on
-the device it actually runs on. `compress()` does the same, and also times the original
-with identical iteration/warmup settings on that same device: for fp16 and GPTQ that is
-the main compute device; for dynamic INT8 (CPU-only) the original is re-timed on CPU, so
-`latency_speedup` and `cqi` compare CPU against CPU.
+compressed model, never an intermediate one.
 
 ---
 
@@ -512,8 +510,10 @@ remaining trials across every phase; final selection still runs on whatever's
 cached, and returns `None` only if literally nothing ever succeeded.
 
 Cached to `epsilon_cache.json`, keyed by epsilon value only - delete it after
-changing CQI weights or latency settings, or old and new scores mix under the
-same key.
+changing CQI weights or latency settings, or old and new scores mix under the same
+key.
+
+The search is drawn as `epsilon_landscape.png` - see [Search Graphs](#search-graphs).
 
 ```python
 FIND_OPTIMAL_EPSILON      = True
@@ -534,12 +534,60 @@ Scoring includes KL divergence from pruning's own behavioral probe
 distribution even when raw accuracy looks fine. Shares the same
 2-consecutive-structural-failure abort as the epsilon search.
 
+The search is drawn as `pruning_search.png` - see [Search Graphs](#search-graphs).
+
 ```python
 FIND_OPTIMAL_PRUNING      = True
 PRUNING_SEARCH_NUM_TRIALS = 15
 PRUNING_SEARCH_FT_EPOCHS  = 3     # per-trial fine-tune epochs (fast approximation)
 PRUNING_SEARCH_FT_LR      = 1e-4
 ```
+
+### Search Graphs
+
+Both searches can be drawn. The two functions live in `visualization.py`, are pure
+renderers (they never run a model or a search), and take what the search returned:
+`(optimum, results, history)`.
+
+| Graph | Function | Written by |
+|---|---|---|
+| `epsilon_landscape.png` | `plot_epsilon_landscape` | `python main.py` after the epsilon search; `compress()` when `find_optimal_epsilon=True` and `save_report=True` |
+| `pruning_search.png` | `plot_pruning_search` | `compress()` when `find_optimal_pruning=True` and `save_report=True`. `python main.py` does not draw it yet. |
+
+**Epsilon landscape** - four panels:
+1. CQI vs ε at the five anchors, a cubic spline through them, and a star at the chosen ε.
+2. Accuracy and size across the anchors (dual axis).
+3. Ternary search path - every refinement evaluation, numbered in evaluation order,
+   over a faint copy of the spline.
+4. Top 3 candidates by CQI, annotated with accuracy / size / score.
+
+**Pruning search** - four panels:
+1. CQI vs global pruning ratio: the ratio anchors (circles) and the ternary
+   refinement points (diamonds, numbered in evaluation order), all at the configured
+   `max_pruning_ratio`. A dashed red line marks the chosen ratio.
+2. Accuracy and size vs pruning ratio (same points), with the
+   `ACCURACY_DROP_THRESHOLD` budget shaded green.
+3. Accuracy and size across the `max_pruning_ratio` grid, at the single pruning ratio
+   the grid ran at.
+4. Top 5 candidates over the entire search, ranked the way the final selection ranks
+   them (within the budget first, then by score). A star marks the chosen
+   configuration; each label gives accuracy, size, and the true score.
+
+**Off-scale trials.** Past the accuracy budget CQI falls away exponentially (see the
+CQI section), so one over-compressed trial can score -1e8, -1e40, or worse. On a
+linear axis that flattens every other point, and a log axis would spend most of its
+height on a range nobody can act on. Instead the useful range stays linear: a trial
+whose CQI is below the axis floor (`-0.35 ×` the best score in that panel, with the
+best score taken as at least 1.0) is pinned to the bottom of the axis, drawn as a
+red-edged triangle, and the legend gives its true CQI (or the range, if there are
+several). The epsilon landscape also skips its cubic spline in that case -
+interpolating across a cliff of that size rings wildly and says nothing.
+
+**What is plotted.** Every trial in the search's cache file, including trials from
+earlier runs that share it - delete the cache file (see the CQI cache note under
+[Things That Will Break and Why](#things-that-will-break-and-why)) to see only the
+current run. A search that found nothing viable is still drawn: that is when the
+graph is most useful.
 
 ---
 
@@ -561,7 +609,7 @@ continuously and driven by `ceiling` / `penalty_slope` / `penalty_steepness` -
 replacing the older `acc_ratio ** w_accuracy` term (kept as a fallback for
 legacy callers that don't pass `accuracy_drop_threshold`). The exact per-piece
 formulas need the real `optimization.py` source before this section can state
-them precisely.
+them precisely - flagging rather than guessing at the equations.
 
 Size, latency, and KL factors are unaffected by the above - still plain ratios
 raised to their weight.
@@ -600,14 +648,6 @@ NUM_CLASSES       = 102    # fallback only — the registry sets this per model
 PRETRAIN_EPOCHS = 10       # only used when no checkpoint exists
 PRETRAIN_LR     = 0.001
 FORCE_RETRAIN   = False
-
-#`train_model` evaluates on the test set after every epoch and restores the
-#best-scoring epoch's weights before returning, so the model returned by
-#`load_from_registry()` / `load_or_train_from_registry()` always matches the
-#checkpoint on disk, and `compress()`'s baseline accuracy is the same whether
-#the model was just trained or loaded from a checkpoint. Note the best epoch
-#is selected on the same test set later used for the baseline and every
-#accuracy gate, so that baseline is a max over epochs and slightly optimistic.
 
 EXPORT_ONNX = False
 RUN_ONNX    = False
@@ -834,7 +874,8 @@ The model registry `recommended` config sets this automatically.
 |---|---|
 | `compression_report.png` | Every run |
 | `pruning_report.png` | `USE_PRUNING = True` AND pruning survived its accuracy gate |
-| `epsilon_landscape.png` | `FIND_OPTIMAL_EPSILON = True` AND `USE_LOW_RANK` wasn't auto-disabled |
+| `epsilon_landscape.png` | `FIND_OPTIMAL_EPSILON = True` AND `USE_LOW_RANK` wasn't auto-disabled (also written by `compress()` when `find_optimal_epsilon=True` and `save_report=True`) |
+| `pruning_search.png` | `compress()` with `find_optimal_pruning=True` and `save_report=True` (not written by `python main.py` yet) - see [Search Graphs](#search-graphs) |
 | `epsilon_cache.json` | `FIND_OPTIMAL_EPSILON = True` (crash recovery) |
 | `pruning_search_cache.json` | `FIND_OPTIMAL_PRUNING = True` (crash recovery) |
 | `models/{ACTIVE_MODEL}.pth` | First run or `FORCE_RETRAIN = True` |
