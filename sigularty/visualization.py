@@ -126,7 +126,7 @@ def _mark_off_scale(ax, xs, shown, scores, off, face) -> None:
     rng  = (_fmt_score(true[0]) if len(true) == 1
             else f"{_fmt_score(min(true))} … {_fmt_score(max(true))}")
     ax.scatter([xs[i] for i in idx], [shown[i] for i in idx],
-               marker='v', s=170, color=face, edgecolors='#e74c3c',
+               marker='v', s=120, color=face, edgecolors='#e74c3c',
                linewidths=2, zorder=7,
                label=f'Off-scale ×{len(idx)} (true CQI {rng})')
 
@@ -402,8 +402,13 @@ def plot_epsilon_landscape(
     # Anchor scatter points.  Anchors whose CQI is below the axis floor are
     # pinned to it and drawn as red-edged triangles (true value in the legend).
     shown_scores, off_scale = _pin_scores(anchor_scores, anchor_clip)
+    if spline is None and len(anchor_eps) >= 2:
+        # No cubic spline (fewer than 4 anchors, or an anchor is off-scale):
+        # join the anchors with straight segments so the trend is still visible.
+        ax1.plot(anchor_eps, shown_scores, linestyle='--', color=BLUE, alpha=0.5,
+                 linewidth=1.5, label='Anchor trend')
     ax1.scatter(anchor_eps, shown_scores,
-                s=150, color=BLUE, edgecolors='black', zorder=5,
+                s=110, color=BLUE, edgecolors='black', zorder=5,
                 label='Anchor points')
     _mark_off_scale(ax1, anchor_eps, shown_scores, anchor_scores, off_scale, BLUE)
 
@@ -426,7 +431,7 @@ def plot_epsilon_landscape(
         if anchor_clip is not None:
             opt_score = max(opt_score, anchor_clip.floor)
         ax1.scatter([optimal_epsilon], [opt_score],
-                    marker='*', s=350, color='red', edgecolors='darkred',
+                    marker='*', s=260, color='red', edgecolors='darkred',
                     zorder=10, label=f'Optimal ε={optimal_epsilon:.2f}')
 
     if anchor_clip is not None:
@@ -435,7 +440,7 @@ def plot_epsilon_landscape(
     ax1.set_ylabel('CQI (Compression Quality Index)', fontweight='bold')
     ax1.set_title('Compression Quality Index (CQI) Landscape', fontweight='bold', fontsize=12)
     ax1.grid(alpha=0.3)
-    ax1.legend(loc='upper right', fontsize=8)
+    ax1.legend(loc='best', fontsize=8, markerscale=0.6, framealpha=0.85)
 
     # =========================================================================
     # PANEL 2 — Anchor Points: Accuracy vs Size (dual axis)
@@ -467,7 +472,7 @@ def plot_epsilon_landscape(
     handles = [line_acc, line_size]
     if vline is not None:
         handles.append(vline)
-    ax2.legend(handles=handles, loc='upper center', fontsize=8)
+    ax2.legend(handles=handles, loc='lower right', fontsize=8, framealpha=0.85)
 
     # =========================================================================
     # PANEL 3 — Ternary Search Path
@@ -493,8 +498,13 @@ def plot_epsilon_landscape(
         tern_clip       = _score_clip(ternary_scores + _opt_scores)
         shown_tern, off_tern = _pin_scores(ternary_scores, tern_clip)
 
+        # Thin line through the evaluations in epsilon order: the landscape the
+        # refinement actually sampled (the numbers give the order it ran in).
+        _order = sorted(range(len(ternary_eps)), key=lambda i: ternary_eps[i])
+        ax3.plot([ternary_eps[i] for i in _order], [shown_tern[i] for i in _order],
+                 linestyle='--', color=ORANGE, alpha=0.45, linewidth=1.5)
         ax3.scatter(ternary_eps, shown_tern,
-                    marker='D', s=120, color=ORANGE, edgecolors='black',
+                    marker='D', s=90, color=ORANGE, edgecolors='black',
                     zorder=5, label='Ternary search evaluations')
         _mark_off_scale(ax3, ternary_eps, shown_tern, ternary_scores, off_tern, ORANGE)
 
@@ -516,7 +526,7 @@ def plot_epsilon_landscape(
             if tern_clip is not None:
                 opt_score = max(opt_score, tern_clip.floor)
             ax3.scatter([optimal_epsilon], [opt_score],
-                        marker='*', s=350, color='red', edgecolors='darkred',
+                        marker='*', s=260, color='red', edgecolors='darkred',
                         zorder=10, label=f'Optimal ε={optimal_epsilon:.2f}')
 
         if tern_clip is not None:
@@ -525,7 +535,7 @@ def plot_epsilon_landscape(
         ax3.set_ylabel('CQI', fontweight='bold')
         ax3.set_title('Ternary Search Path', fontweight='bold', fontsize=12)
         ax3.grid(alpha=0.3)
-        ax3.legend(loc='upper right', fontsize=8)
+        ax3.legend(loc='best', fontsize=8, markerscale=0.6, framealpha=0.85)
 
     # =========================================================================
     # PANEL 4 — Top 3 Candidates (horizontal bar chart, best at top)
@@ -561,12 +571,14 @@ def plot_epsilon_landscape(
 
         # Annotate each bar at the right end with accuracy / size / score
         x_max = max(r[1]['score'] for r in top3_display) if top3_display else 1.0
-        for y_pos, (eps, r), shown in zip(y_indices, top3_display, shown_bars):
-            label = (f"  {r['accuracy']:.1f}%  |  "
+        for y_pos, (eps, r) in zip(y_indices, top3_display):
+            label = (f"{r['accuracy']:.1f}%  |  "
                      f"{r['size_mb']:.2f} MB  |  "
                      f"score={_fmt_score(r['score'])}")
-            ax4.text(shown, y_pos, label,
-                     va='center', fontsize=9, color=DARK)
+            # Inside the bar, so a long label never spills over into the
+            # neighbouring panel.
+            ax4.text(0.015, y_pos, label, transform=ax4.get_yaxis_transform(),
+                     va='center', ha='left', fontsize=9, color=DARK)
 
         # Tie-break annotation on the winning bar
         if tie_broken and optimal_epsilon is not None:
@@ -593,7 +605,7 @@ def plot_epsilon_landscape(
         ax4.legend(loc='lower right', fontsize=8)
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout(rect=[0, 0, 1, 0.96], pad=1.5, h_pad=2.5, w_pad=3.0)
     plt.savefig(save_path, dpi=200, bbox_inches='tight',
                 facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -786,7 +798,7 @@ def plot_pruning_search(
     ax1.set_title(f'CQI vs Pruning Ratio  (max_ratio={base_max:.2f})',
                   fontweight='bold', fontsize=12)
     ax1.grid(alpha=0.3)
-    ax1.legend(loc='best', fontsize=8)
+    ax1.legend(loc='best', fontsize=8, markerscale=0.6, framealpha=0.85)
 
     # =========================================================================
     # PANEL 2 — Accuracy vs size across the ratio trials (dual axis)
@@ -889,7 +901,7 @@ def plot_pruning_search(
     ax4.legend(loc='lower right', fontsize=8)
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout(rect=[0, 0, 1, 0.96], pad=1.5, h_pad=2.5, w_pad=3.0)
     plt.savefig(save_path, dpi=200, bbox_inches='tight',
                 facecolor=fig.get_facecolor())
     plt.close(fig)
